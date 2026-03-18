@@ -8,10 +8,16 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Connect to Tailscale (Headscale)
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --login-server https://headscale.kautiontape.com --accept-routes
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.KTN_HOST }}
+          host: kautiontape-new.yuffie.ts.net
           username: shawn
           key: ${{ secrets.KTN_SSH_KEY }}
           script: |
