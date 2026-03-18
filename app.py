@@ -699,7 +699,7 @@ function showDiagnostics(data) {
       '</div>' +
       '<div class="mode-desc">' + m.desc + '</div>' +
       (canFix.length ? '<div class="mode-fixes">Fixes: ' + canFix.map(f => CHECK_LABELS[f]).join(', ') + '</div>' : '') +
-      (cantFix.length ? '<div class="mode-nofixes">Won\'t fix: ' + cantFix.map(f => CHECK_LABELS[f]).join(', ') + '</div>' : '');
+      (cantFix.length ? '<div class="mode-nofixes">Cannot fix: ' + cantFix.map(f => CHECK_LABELS[f]).join(', ') + '</div>' : '');
 
     if (!disabled) {
       card.addEventListener('click', () => {
