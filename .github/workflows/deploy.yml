@@ -1,12 +1,12 @@
 name: Deploy to ktn
 on:
   # Auto-deploy after each successful image build (push-based; the runner pulls
-  # when we ship — no build on the box). COMMENTED until the first cutover to the
-  # GHCR image is verified; enable then by uncommenting these four lines.
-  # workflow_run:
-  #   workflows: ['build & publish']
-  #   types: [completed]
-  #   branches: [main]
+  # when we ship — no build on the box). Enabled after the first cutover to the
+  # GHCR image was verified byte-identical (2026-06-14).
+  workflow_run:
+    workflows: ['build & publish']
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 jobs:
   deploy:
