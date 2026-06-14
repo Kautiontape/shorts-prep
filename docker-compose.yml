@@ -1,6 +1,6 @@
 services:
   app:
-    build: .
+    image: ghcr.io/kautiontape/shorts-prep:latest
     container_name: shorts_prep
     ports:
       - "127.0.0.1:8103:8080"

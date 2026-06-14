@@ -1,16 +1,29 @@
 name: Deploy to ktn
-
 on:
-  push:
-    branches: [main]
-
+  # Auto-deploy after each successful image build (push-based; the runner pulls
+  # when we ship — no build on the box). COMMENTED until the first cutover to the
+  # GHCR image is verified; enable then by uncommenting these four lines.
+  # workflow_run:
+  #   workflows: ['build & publish']
+  #   types: [completed]
+  #   branches: [main]
+  workflow_dispatch:
 jobs:
   deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: [self-hosted, ktn]
+    permissions:
+      packages: read
     steps:
-      - name: Deploy
+      # Ephemeral per-run login so the pull works whether the GHCR package is
+      # public or private — no long-lived token stored on the runner.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      # Pull the cloud-built image and restart in place. No build on ktn.
+      - name: Pull image and restart
         run: |
           cd /opt/services/shorts-prep
           git pull origin main
-          docker compose build
+          docker compose pull
           docker compose up -d
+          docker image prune -f
