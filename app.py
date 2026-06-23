@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from flask import Flask, request, send_file, jsonify
+import r2
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
@@ -24,6 +26,9 @@ except (OSError, FileNotFoundError):
     BSF_AVAILABLE = False
 
 STANDARD_FRAMERATES = {24, 25, 30, 48, 50, 60}
+
+JOB_ID_RE = re.compile(r'^[0-9a-f]{12}$')
+ALLOWED_EXT = {'.mov', '.mp4'}
 
 # Labels for the compatibility checks
 CHECK_LABELS = {
@@ -800,6 +805,22 @@ function showError(msg) {
 @app.route('/')
 def index():
     return HTML
+
+
+@app.route('/create-upload', methods=['POST'])
+def create_upload():
+    cleanup_old_jobs()
+    data = request.get_json(silent=True) or {}
+    filename = (data.get('filename') or '').strip()
+    if not filename:
+        return jsonify(error='No filename provided'), 400
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify(error='Please use a .mov or .mp4 file'), 400
+    job_id = uuid.uuid4().hex[:12]
+    key = f'inputs/{job_id}{ext}'
+    put_url = r2.presign_put(key)
+    return jsonify(job_id=job_id, put_url=put_url, key=key)
 
 
 @app.route('/analyze', methods=['POST'])
