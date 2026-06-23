@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -7,19 +8,39 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify
+import r2
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
+
+from werkzeug.exceptions import HTTPException
+
+
+@app.errorhandler(HTTPException)
+def _json_http_error(e):
+    return jsonify(error=e.description, status=e.code), e.code
+
+
+@app.errorhandler(Exception)
+def _json_error(e):
+    # Flask logs the traceback server-side; don't leak internals to the client.
+    return jsonify(error='Internal server error', status=500), 500
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Check if h264_metadata bitstream filter is available
-_bsf_check = subprocess.run(['ffmpeg', '-bsfs'], capture_output=True, text=True)
-BSF_AVAILABLE = 'h264_metadata' in _bsf_check.stdout
+# Check if h264_metadata bitstream filter is available (degrade gracefully if
+# ffmpeg is absent, e.g. in the test environment).
+try:
+    _bsf_check = subprocess.run(['ffmpeg', '-bsfs'], capture_output=True, text=True)
+    BSF_AVAILABLE = 'h264_metadata' in _bsf_check.stdout
+except (OSError, FileNotFoundError):
+    BSF_AVAILABLE = False
 
 STANDARD_FRAMERATES = {24, 25, 30, 48, 50, 60}
+
+JOB_ID_RE = re.compile(r'^[0-9a-f]{12}$')
+ALLOWED_EXT = {'.mov', '.mp4'}
 
 # Labels for the compatibility checks
 CHECK_LABELS = {
@@ -619,37 +640,85 @@ async function analyzeFile(file) {
   showPanel('uploadPanel');
   fileName.textContent = file.name;
   progressFill.classList.remove('indeterminate');
+  progressFill.style.width = '0%';
 
   try {
-    const form = new FormData();
-    form.append('file', file);
-    const xhr = new XMLHttpRequest();
-    const done = new Promise((resolve, reject) => {
-      xhr.upload.addEventListener('progress', e => {
-        if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          progressFill.style.width = pct + '%';
-          statusText.textContent = 'Uploading... ' + pct + '%';
-        }
-      });
-      xhr.addEventListener('load', () => resolve(xhr));
-      xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+    // 1. Get a presigned upload URL
+    statusText.textContent = 'Preparing upload...';
+    const cuResp = await fetch('/create-upload', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename: file.name}),
     });
-    xhr.open('POST', '/analyze');
-    xhr.send(form);
-    await done;
+    const cu = await readJson(cuResp);
+    if (!cuResp.ok) throw new Error(cu.error || ('HTTP ' + cuResp.status));
 
-    if (xhr.status !== 200) {
-      const err = JSON.parse(xhr.responseText);
-      throw new Error(err.error || 'Analysis failed');
-    }
-    const data = JSON.parse(xhr.responseText);
+    // 2. PUT the file straight to R2 (bypasses the proxy size cap)
+    await putToR2(cu.put_url, file);
+
+    // 3. Analyze the uploaded object
+    statusText.textContent = 'Analyzing...';
+    progressFill.classList.add('indeterminate');
+    const anResp = await fetch('/analyze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: cu.job_id, filename: file.name}),
+    });
+    const data = await readJson(anResp);
+    if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
     currentJobId = data.id;
     showDiagnostics(data);
   } catch (err) {
     showError(err.message);
     showPanel(null);
   }
+}
+
+// Read a response as text and parse JSON defensively, so an HTML error page
+// (e.g. from a proxy) surfaces as a readable message instead of a parse crash.
+async function readJson(resp) {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const excerpt = text.replace(/\\s+/g, ' ').trim().slice(0, 200);
+    throw new Error('HTTP ' + resp.status + ': ' + (excerpt || resp.statusText));
+  }
+}
+
+// PUT a file to a presigned URL with progress reporting and a stall watchdog
+// that aborts if no bytes move for 30s (so it never sits silently at 1%).
+function putToR2(url, file) {
+  const STALL_MS = 30000;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let lastLoaded = 0;
+    let lastMove = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastMove > STALL_MS) {
+        clearInterval(watchdog);
+        xhr.abort();
+        reject(new Error('Upload stalled \\u2014 no progress for 30s. Check your connection and retry.'));
+      }
+    }, 5000);
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable) {
+        if (e.loaded !== lastLoaded) { lastLoaded = e.loaded; lastMove = Date.now(); }
+        const pct = Math.round((e.loaded / e.total) * 100);
+        progressFill.style.width = pct + '%';
+        statusText.textContent = 'Uploading... ' + pct + '%';
+      }
+    });
+    xhr.addEventListener('load', () => {
+      clearInterval(watchdog);
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error('Upload failed (HTTP ' + xhr.status + ')'));
+    });
+    xhr.addEventListener('error', () => { clearInterval(watchdog); reject(new Error('Upload failed \\u2014 network error')); });
+    xhr.addEventListener('abort', () => { clearInterval(watchdog); });
+    xhr.open('PUT', url);
+    xhr.send(file);
+  });
 }
 
 function showDiagnostics(data) {
@@ -765,10 +834,9 @@ function showResults(result) {
   // Fix grid to 3 cols: label, before, after
   baGrid.style.gridTemplateColumns = 'auto 1fr 1fr';
 
-  // Download link
-  const dlPath = '/download/' + result.id;
-  const fullUrl = window.location.origin + dlPath;
-  downloadBtn.href = dlPath;
+  // Download link (presigned R2 GET URL)
+  const fullUrl = result.download_url;
+  downloadBtn.href = fullUrl;
   downloadBtn.download = result.output_name;
   linkUrl.textContent = fullUrl;
 
@@ -798,34 +866,61 @@ def index():
     return HTML
 
 
+@app.route('/create-upload', methods=['POST'])
+def create_upload():
+    cleanup_old_jobs()
+    data = request.get_json(silent=True) or {}
+    filename = (data.get('filename') or '').strip()
+    if not filename:
+        return jsonify(error='No filename provided'), 400
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify(error='Please use a .mov or .mp4 file'), 400
+    job_id = uuid.uuid4().hex[:12]
+    key = f'inputs/{job_id}{ext}'
+    put_url = r2.presign_put(key)
+    return jsonify(job_id=job_id, put_url=put_url, key=key)
+
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     cleanup_old_jobs()
+    data = request.get_json(silent=True) or {}
+    job_id = (data.get('job_id') or '').strip()
+    filename = (data.get('filename') or '').strip()
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify(error='Invalid file type'), 400
 
-    if 'file' not in request.files:
-        return jsonify(error='No file uploaded'), 400
-    f = request.files['file']
-    if not f.filename:
-        return jsonify(error='No file selected'), 400
-
-    job_id = uuid.uuid4().hex[:12]
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    input_path = job_dir / f'input{ext}'
+    key = f'inputs/{job_id}{ext}'
 
-    input_path = job_dir / f'input{Path(f.filename).suffix}'
-    f.save(input_path)
+    try:
+        r2.download_to(key, input_path)
+    except Exception as e:
+        return jsonify(error=f'Could not fetch upload: {e}'), 502
 
-    # Save original filename for later
-    (job_dir / '.original_name').write_text(f.filename)
+    # Save original filename for the output name later.
+    (job_dir / '.original_name').write_text(filename)
 
     probe = probe_detailed(str(input_path))
     checks = run_checks(probe, str(input_path))
     rec = recommend_mode(checks)
     file_size = input_path.stat().st_size / (1024 * 1024)
 
+    # The local copy is the working copy now; drop the R2 input.
+    try:
+        r2.delete(key)
+    except Exception:
+        pass
+
     return jsonify(
         id=job_id,
-        filename=f.filename,
+        filename=filename,
         file_size_mb=file_size,
         checks=checks,
         recommended_mode=rec,
@@ -835,6 +930,8 @@ def analyze():
 
 @app.route('/process/<job_id>', methods=['POST'])
 def process(job_id):
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
     job_dir = UPLOAD_DIR / job_id
     if not job_dir.exists():
         return jsonify(error='Job not found'), 404
@@ -867,18 +964,24 @@ def process(job_id):
 
     cmd = build_ffmpeg_cmd(mode, input_path, output_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
-
     if result.returncode != 0:
         return jsonify(error=f'ffmpeg failed: {result.stderr[-500:]}'), 500
 
     # Probe after
     after_probe = probe_detailed(str(output_path))
     after_checks = run_checks(after_probe, str(output_path))
-
-    # Clean up input
-    input_path.unlink(missing_ok=True)
-
     out_size = output_path.stat().st_size / (1024 * 1024)
+
+    # Store the result in R2 and hand back a presigned download URL.
+    out_key = f'outputs/{job_id}/{output_name}'
+    try:
+        r2.upload_file(output_path, out_key, content_type='video/mp4')
+    except Exception as e:
+        return jsonify(error=f'Could not store result: {e}'), 502
+    download_url = r2.presign_get(out_key, output_name)
+
+    # Clean up local working files.
+    shutil.rmtree(job_dir, ignore_errors=True)
 
     return jsonify(
         id=job_id,
@@ -887,19 +990,8 @@ def process(job_id):
         before_checks=before_checks,
         after_checks=after_checks,
         file_size_mb=out_size,
+        download_url=download_url,
     )
-
-
-@app.route('/download/<job_id>')
-def download(job_id):
-    job_dir = UPLOAD_DIR / job_id
-    if not job_dir.exists():
-        return jsonify(error='Not found'), 404
-    files = [f for f in job_dir.iterdir()
-             if f.suffix == '.mp4' and not f.name.startswith('input')]
-    if not files:
-        return jsonify(error='Output not found'), 404
-    return send_file(files[0], as_attachment=True)
 
 
 if __name__ == '__main__':
