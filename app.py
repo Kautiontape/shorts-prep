@@ -639,37 +639,85 @@ async function analyzeFile(file) {
   showPanel('uploadPanel');
   fileName.textContent = file.name;
   progressFill.classList.remove('indeterminate');
+  progressFill.style.width = '0%';
 
   try {
-    const form = new FormData();
-    form.append('file', file);
-    const xhr = new XMLHttpRequest();
-    const done = new Promise((resolve, reject) => {
-      xhr.upload.addEventListener('progress', e => {
-        if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          progressFill.style.width = pct + '%';
-          statusText.textContent = 'Uploading... ' + pct + '%';
-        }
-      });
-      xhr.addEventListener('load', () => resolve(xhr));
-      xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+    // 1. Get a presigned upload URL
+    statusText.textContent = 'Preparing upload...';
+    const cuResp = await fetch('/create-upload', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename: file.name}),
     });
-    xhr.open('POST', '/analyze');
-    xhr.send(form);
-    await done;
+    const cu = await readJson(cuResp);
+    if (!cuResp.ok) throw new Error(cu.error || ('HTTP ' + cuResp.status));
 
-    if (xhr.status !== 200) {
-      const err = JSON.parse(xhr.responseText);
-      throw new Error(err.error || 'Analysis failed');
-    }
-    const data = JSON.parse(xhr.responseText);
+    // 2. PUT the file straight to R2 (bypasses the proxy size cap)
+    await putToR2(cu.put_url, file);
+
+    // 3. Analyze the uploaded object
+    statusText.textContent = 'Analyzing...';
+    progressFill.classList.add('indeterminate');
+    const anResp = await fetch('/analyze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: cu.job_id, filename: file.name}),
+    });
+    const data = await readJson(anResp);
+    if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
     currentJobId = data.id;
     showDiagnostics(data);
   } catch (err) {
     showError(err.message);
     showPanel(null);
   }
+}
+
+// Read a response as text and parse JSON defensively, so an HTML error page
+// (e.g. from a proxy) surfaces as a readable message instead of a parse crash.
+async function readJson(resp) {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const excerpt = text.replace(/\\s+/g, ' ').trim().slice(0, 200);
+    throw new Error('HTTP ' + resp.status + ': ' + (excerpt || resp.statusText));
+  }
+}
+
+// PUT a file to a presigned URL with progress reporting and a stall watchdog
+// that aborts if no bytes move for 30s (so it never sits silently at 1%).
+function putToR2(url, file) {
+  const STALL_MS = 30000;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let lastLoaded = 0;
+    let lastMove = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastMove > STALL_MS) {
+        clearInterval(watchdog);
+        xhr.abort();
+        reject(new Error('Upload stalled \\u2014 no progress for 30s. Check your connection and retry.'));
+      }
+    }, 5000);
+    xhr.upload.addEventListener('progress', e => {
+      if (e.lengthComputable) {
+        if (e.loaded !== lastLoaded) { lastLoaded = e.loaded; lastMove = Date.now(); }
+        const pct = Math.round((e.loaded / e.total) * 100);
+        progressFill.style.width = pct + '%';
+        statusText.textContent = 'Uploading... ' + pct + '%';
+      }
+    });
+    xhr.addEventListener('load', () => {
+      clearInterval(watchdog);
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error('Upload failed (HTTP ' + xhr.status + ')'));
+    });
+    xhr.addEventListener('error', () => { clearInterval(watchdog); reject(new Error('Upload failed \\u2014 network error')); });
+    xhr.addEventListener('abort', () => { clearInterval(watchdog); });
+    xhr.open('PUT', url);
+    xhr.send(file);
+  });
 }
 
 function showDiagnostics(data) {
@@ -785,10 +833,9 @@ function showResults(result) {
   // Fix grid to 3 cols: label, before, after
   baGrid.style.gridTemplateColumns = 'auto 1fr 1fr';
 
-  // Download link
-  const dlPath = '/download/' + result.id;
-  const fullUrl = window.location.origin + dlPath;
-  downloadBtn.href = dlPath;
+  // Download link (presigned R2 GET URL)
+  const fullUrl = result.download_url;
+  downloadBtn.href = fullUrl;
   downloadBtn.download = result.output_name;
   linkUrl.textContent = fullUrl;
 
