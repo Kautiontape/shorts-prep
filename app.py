@@ -15,9 +15,13 @@ app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Check if h264_metadata bitstream filter is available
-_bsf_check = subprocess.run(['ffmpeg', '-bsfs'], capture_output=True, text=True)
-BSF_AVAILABLE = 'h264_metadata' in _bsf_check.stdout
+# Check if h264_metadata bitstream filter is available (degrade gracefully if
+# ffmpeg is absent, e.g. in the test environment).
+try:
+    _bsf_check = subprocess.run(['ffmpeg', '-bsfs'], capture_output=True, text=True)
+    BSF_AVAILABLE = 'h264_metadata' in _bsf_check.stdout
+except (OSError, FileNotFoundError):
+    BSF_AVAILABLE = False
 
 STANDARD_FRAMERATES = {24, 25, 30, 48, 50, 60}
 
