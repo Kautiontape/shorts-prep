@@ -838,31 +838,42 @@ def create_upload():
 @app.route('/analyze', methods=['POST'])
 def analyze():
     cleanup_old_jobs()
+    data = request.get_json(silent=True) or {}
+    job_id = (data.get('job_id') or '').strip()
+    filename = (data.get('filename') or '').strip()
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify(error='Invalid file type'), 400
 
-    if 'file' not in request.files:
-        return jsonify(error='No file uploaded'), 400
-    f = request.files['file']
-    if not f.filename:
-        return jsonify(error='No file selected'), 400
-
-    job_id = uuid.uuid4().hex[:12]
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    input_path = job_dir / f'input{ext}'
+    key = f'inputs/{job_id}{ext}'
 
-    input_path = job_dir / f'input{Path(f.filename).suffix}'
-    f.save(input_path)
+    try:
+        r2.download_to(key, input_path)
+    except Exception as e:
+        return jsonify(error=f'Could not fetch upload: {e}'), 502
 
-    # Save original filename for later
-    (job_dir / '.original_name').write_text(f.filename)
+    # Save original filename for the output name later.
+    (job_dir / '.original_name').write_text(filename)
 
     probe = probe_detailed(str(input_path))
     checks = run_checks(probe, str(input_path))
     rec = recommend_mode(checks)
     file_size = input_path.stat().st_size / (1024 * 1024)
 
+    # The local copy is the working copy now; drop the R2 input.
+    try:
+        r2.delete(key)
+    except Exception:
+        pass
+
     return jsonify(
         id=job_id,
-        filename=f.filename,
+        filename=filename,
         file_size_mb=file_size,
         checks=checks,
         recommended_mode=rec,
