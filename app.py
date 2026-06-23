@@ -8,11 +8,10 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify
 import r2
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
 
 from werkzeug.exceptions import HTTPException
 
@@ -945,18 +944,6 @@ def process(job_id):
         file_size_mb=out_size,
         download_url=download_url,
     )
-
-
-@app.route('/download/<job_id>')
-def download(job_id):
-    job_dir = UPLOAD_DIR / job_id
-    if not job_dir.exists():
-        return jsonify(error='Not found'), 404
-    files = [f for f in job_dir.iterdir()
-             if f.suffix == '.mp4' and not f.name.startswith('input')]
-    if not files:
-        return jsonify(error='Output not found'), 404
-    return send_file(files[0], as_attachment=True)
 
 
 if __name__ == '__main__':

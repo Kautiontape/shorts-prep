@@ -120,3 +120,9 @@ def test_process_ffmpeg_failure_returns_500(client, monkeypatch):
     monkeypatch.setattr(app.subprocess, 'run', fail_run)
     resp = client.post('/process/abcdef000bad', json={'mode': 'quick_fix'})
     assert resp.status_code == 500
+
+
+def test_download_route_removed(client):
+    resp = client.get('/download/abcdef012345')
+    assert resp.status_code == 404
+    assert resp.get_json() is not None  # JSON 404, not HTML
