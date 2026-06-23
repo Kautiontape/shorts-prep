@@ -23,7 +23,8 @@ def _json_http_error(e):
 
 @app.errorhandler(Exception)
 def _json_error(e):
-    return jsonify(error=str(e) or 'Internal server error', status=500), 500
+    # Flask logs the traceback server-side; don't leak internals to the client.
+    return jsonify(error='Internal server error', status=500), 500
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'
 UPLOAD_DIR.mkdir(exist_ok=True)
