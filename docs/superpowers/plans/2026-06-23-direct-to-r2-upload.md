@@ -594,7 +594,7 @@ def test_process_invalid_mode_returns_400(client):
 
 def test_process_ffmpeg_failure_returns_500(client, monkeypatch):
     import app
-    _seed_job(app, job_id='abcdeffailed')
+    _seed_job(app, job_id='abcdef000bad')  # must be 12 lowercase-hex chars
     monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
     monkeypatch.setattr(app, 'run_checks', lambda probe, p: {})
     def fail_run(cmd, capture_output=True, text=True):
@@ -603,7 +603,7 @@ def test_process_ffmpeg_failure_returns_500(client, monkeypatch):
             stderr = 'boom'
         return R()
     monkeypatch.setattr(app.subprocess, 'run', fail_run)
-    resp = client.post('/process/abcdeffailed', json={'mode': 'quick_fix'})
+    resp = client.post('/process/abcdef000bad', json={'mode': 'quick_fix'})
     assert resp.status_code == 500
 ```
 
