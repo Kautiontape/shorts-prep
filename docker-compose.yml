@@ -2,6 +2,7 @@ services:
   app:
     image: ghcr.io/kautiontape/shorts-prep:latest
     container_name: shorts_prep
+    env_file: .env
     ports:
       - "127.0.0.1:8103:8080"
     volumes:
