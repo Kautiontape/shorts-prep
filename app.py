@@ -883,6 +883,8 @@ def analyze():
 
 @app.route('/process/<job_id>', methods=['POST'])
 def process(job_id):
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
     job_dir = UPLOAD_DIR / job_id
     if not job_dir.exists():
         return jsonify(error='Job not found'), 404
@@ -915,18 +917,24 @@ def process(job_id):
 
     cmd = build_ffmpeg_cmd(mode, input_path, output_path)
     result = subprocess.run(cmd, capture_output=True, text=True)
-
     if result.returncode != 0:
         return jsonify(error=f'ffmpeg failed: {result.stderr[-500:]}'), 500
 
     # Probe after
     after_probe = probe_detailed(str(output_path))
     after_checks = run_checks(after_probe, str(output_path))
-
-    # Clean up input
-    input_path.unlink(missing_ok=True)
-
     out_size = output_path.stat().st_size / (1024 * 1024)
+
+    # Store the result in R2 and hand back a presigned download URL.
+    out_key = f'outputs/{job_id}/{output_name}'
+    try:
+        r2.upload_file(output_path, out_key, content_type='video/mp4')
+    except Exception as e:
+        return jsonify(error=f'Could not store result: {e}'), 502
+    download_url = r2.presign_get(out_key, output_name)
+
+    # Clean up local working files.
+    shutil.rmtree(job_dir, ignore_errors=True)
 
     return jsonify(
         id=job_id,
@@ -935,6 +943,7 @@ def process(job_id):
         before_checks=before_checks,
         after_checks=after_checks,
         file_size_mb=out_size,
+        download_url=download_url,
     )
 
 
