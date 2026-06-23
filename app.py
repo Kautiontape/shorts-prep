@@ -14,6 +14,18 @@ import r2
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
 
+from werkzeug.exceptions import HTTPException
+
+
+@app.errorhandler(HTTPException)
+def _json_http_error(e):
+    return jsonify(error=e.description, status=e.code), e.code
+
+
+@app.errorhandler(Exception)
+def _json_error(e):
+    return jsonify(error=str(e) or 'Internal server error', status=500), 500
+
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'
 UPLOAD_DIR.mkdir(exist_ok=True)
 

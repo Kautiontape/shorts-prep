@@ -15,3 +15,10 @@ def test_create_upload_rejects_bad_extension(client):
 def test_create_upload_requires_filename(client):
     resp = client.post('/create-upload', json={})
     assert resp.status_code == 400
+
+
+def test_unknown_route_returns_json_not_html(client):
+    resp = client.get('/no-such-route')
+    assert resp.status_code == 404
+    assert resp.get_json() is not None
+    assert 'error' in resp.get_json()
