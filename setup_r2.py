@@ -16,13 +16,25 @@ CORS = {
     }]
 }
 
+# Sources (inputs/) are kept long enough that a past job can be re-processed
+# from the browser's history without re-uploading; outputs/ are kept the same so
+# a saved download link keeps working. Bump these if you want longer history (at
+# the cost of more R2 storage).
 LIFECYCLE = {
-    'Rules': [{
-        'ID': 'expire-jobs',
-        'Status': 'Enabled',
-        'Filter': {'Prefix': ''},
-        'Expiration': {'Days': 1},
-    }]
+    'Rules': [
+        {
+            'ID': 'expire-inputs',
+            'Status': 'Enabled',
+            'Filter': {'Prefix': 'inputs/'},
+            'Expiration': {'Days': 30},
+        },
+        {
+            'ID': 'expire-outputs',
+            'Status': 'Enabled',
+            'Filter': {'Prefix': 'outputs/'},
+            'Expiration': {'Days': 30},
+        },
+    ]
 }
 
 

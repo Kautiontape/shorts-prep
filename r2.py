@@ -48,8 +48,9 @@ def presign_put(key, expires=900):
     )
 
 
-def presign_get(key, download_name, expires=86400):
-    """Presigned GET URL (24 h) that downloads as `download_name`."""
+def presign_get(key, download_name, expires=604800):
+    """Presigned GET URL (7 days, the SigV4 max) that downloads as
+    `download_name`. The long expiry keeps saved history links usable."""
     return _client().generate_presigned_url(
         'get_object',
         Params={
