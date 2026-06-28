@@ -553,6 +553,45 @@ HTML = '''<!DOCTYPE html>
     max-width: 520px; word-break: break-all;
   }
   .error-text.visible { display: block; }
+
+  /* History */
+  .history { width: 100%; max-width: 520px; margin-top: 2rem; display: none; }
+  .history.visible { display: block; }
+  .history-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 0.5rem;
+  }
+  .history-head .section-label { margin: 0; }
+  .history-clear {
+    background: none; border: none; color: #666; font-size: 0.7rem;
+    cursor: pointer; text-decoration: underline;
+  }
+  .history-clear:hover { color: #999; }
+  .history-item {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: #1a1a1a; border-radius: 8px; padding: 0.55rem 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+  .history-info { flex: 1; min-width: 0; }
+  .history-name {
+    font-size: 0.8rem; color: #ddd; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .history-meta { font-size: 0.68rem; color: #666; margin-top: 0.1rem; }
+  .history-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+  .history-btn {
+    background: #333; border: none; color: #ccc; padding: 0.3rem 0.6rem;
+    border-radius: 4px; font-size: 0.72rem; cursor: pointer;
+    white-space: nowrap; transition: background 0.2s; text-decoration: none;
+  }
+  .history-btn:hover { background: #444; }
+  .history-btn.primary { background: #ff4444; color: #fff; }
+  .history-btn.primary:hover { background: #e03030; }
+  .history-remove {
+    background: none; border: none; color: #555; font-size: 1rem;
+    cursor: pointer; line-height: 1; padding: 0 0.2rem;
+  }
+  .history-remove:hover { color: #999; }
 </style>
 </head>
 <body>
@@ -618,6 +657,15 @@ HTML = '''<!DOCTYPE html>
 
 <p class="error-text" id="errorText"></p>
 
+<!-- Past jobs (localStorage only — never leaves this browser) -->
+<div class="history" id="historySection">
+  <div class="history-head">
+    <div class="section-label">Recent jobs</div>
+    <button class="history-clear" id="historyClear">Clear all</button>
+  </div>
+  <div id="historyList"></div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script>
 // Elements
@@ -647,6 +695,9 @@ const qrCode = document.getElementById('qrCode');
 const downloadBtn = document.getElementById('downloadBtn');
 const resetBtn = document.getElementById('resetBtn');
 const errorText = document.getElementById('errorText');
+const historySection = document.getElementById('historySection');
+const historyList = document.getElementById('historyList');
+const historyClear = document.getElementById('historyClear');
 
 const CHECK_LABELS = {
   resolution: 'Resolution', pix_fmt: 'Pixel format', video_codec: 'Video codec',
@@ -662,6 +713,8 @@ const CHECK_ORDER = ['resolution', 'pix_fmt', 'video_codec', 'audio_codec',
 
 let currentJobId = null;
 let selectedMode = null;
+let currentFilename = null;
+let currentFileSizeMb = null;
 
 // Drop zone events
 dropZone.addEventListener('click', () => fileInput.click());
@@ -685,6 +738,11 @@ copyBtn.addEventListener('click', () => {
 
 cancelBtn.addEventListener('click', resetAll);
 resetBtn.addEventListener('click', resetAll);
+
+historyClear.addEventListener('click', () => {
+  saveHistory([]);
+  renderHistory(true);
+});
 
 processBtn.addEventListener('click', async () => {
   if (!currentJobId || !selectedMode) return;
@@ -751,6 +809,8 @@ function resetAll() {
   errorText.classList.remove('visible');
   currentJobId = null;
   selectedMode = null;
+  currentFilename = null;
+  currentFileSizeMb = null;
 }
 
 function showPanel(id) {
@@ -758,6 +818,92 @@ function showPanel(id) {
     document.getElementById(p).classList.toggle('visible', p === id);
   });
   dropZone.classList.toggle('processing', id !== null);
+  // History only shows in the idle state (drop zone visible, no active step).
+  renderHistory(id === null);
+}
+
+// ── Job history (localStorage only — nothing is sent to the server) ──
+// Each entry: { jobId, filename, fileSizeMb, mode, outputName, downloadUrl, ts }
+const HISTORY_KEY = 'shortsPrepJobs';
+const HISTORY_MAX = 25;
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
+  } catch (e) { /* storage full or disabled — history is best-effort */ }
+}
+
+// Record (or refresh) a finished job at the top of the list.
+function recordJob(entry) {
+  const list = loadHistory().filter(j => j.jobId !== entry.jobId);
+  list.unshift(entry);
+  saveHistory(list);
+}
+
+function removeJob(jobId) {
+  saveHistory(loadHistory().filter(j => j.jobId !== jobId));
+  renderHistory(true);
+}
+
+function renderHistory(idle) {
+  const list = loadHistory();
+  historySection.classList.toggle('visible', !!idle && list.length > 0);
+  if (!idle || !list.length) return;
+  historyList.innerHTML = '';
+  list.forEach(entry => {
+    const when = new Date(entry.ts).toLocaleString();
+    const size = entry.fileSizeMb != null ? entry.fileSizeMb.toFixed(1) + ' MB · ' : '';
+    const item = document.createElement('div');
+    item.className = 'history-item';
+
+    const info = document.createElement('div');
+    info.className = 'history-info';
+    info.innerHTML =
+      '<div class="history-name">' + escapeHtml(entry.filename) + '</div>' +
+      '<div class="history-meta">' + size + escapeHtml(entry.mode || '') + ' · ' + escapeHtml(when) + '</div>';
+
+    const actions = document.createElement('div');
+    actions.className = 'history-actions';
+
+    const dl = document.createElement('a');
+    dl.className = 'history-btn';
+    dl.textContent = 'Download';
+    dl.href = entry.downloadUrl || '#';
+    if (entry.outputName) dl.download = entry.outputName;
+
+    const redo = document.createElement('button');
+    redo.className = 'history-btn primary';
+    redo.textContent = 'Re-process';
+    redo.addEventListener('click', () => reprocessJob(entry));
+
+    const del = document.createElement('button');
+    del.className = 'history-remove';
+    del.innerHTML = '&times;';
+    del.title = 'Remove from history';
+    del.addEventListener('click', () => removeJob(entry.jobId));
+
+    actions.appendChild(dl);
+    actions.appendChild(redo);
+    item.appendChild(info);
+    item.appendChild(actions);
+    item.appendChild(del);
+    historyList.appendChild(item);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 }
 
 async function analyzeFile(file) {
@@ -785,17 +931,39 @@ async function analyzeFile(file) {
     // 3. Analyze the uploaded object
     statusText.textContent = 'Analyzing...';
     progressFill.classList.add('indeterminate');
-    const anResp = await fetch('/analyze', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({job_id: cu.job_id, filename: file.name}),
-    });
-    const data = await readJson(anResp);
-    if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
-    currentJobId = data.id;
-    showDiagnostics(data);
+    await runAnalyze(cu.job_id, file.name);
   } catch (err) {
     showError(err.message);
+    showPanel(null);
+  }
+}
+
+// Analyze an object already in R2 (used by a fresh upload and by re-processing a
+// past job from history, which skips the upload entirely).
+async function runAnalyze(jobId, filename) {
+  const anResp = await fetch('/analyze', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({job_id: jobId, filename: filename}),
+  });
+  const data = await readJson(anResp);
+  if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
+  currentJobId = data.id;
+  showDiagnostics(data);
+}
+
+// Re-run a past job: re-analyze its retained R2 source (no re-upload) and drop
+// the user back on the diagnostics panel to pick a mode.
+async function reprocessJob(entry) {
+  errorText.classList.remove('visible');
+  showPanel('uploadPanel');
+  fileName.textContent = entry.filename;
+  progressFill.classList.add('indeterminate');
+  statusText.textContent = 'Loading previous upload...';
+  try {
+    await runAnalyze(entry.jobId, entry.filename);
+  } catch (err) {
+    showError(err.message + ' (the source may have expired — re-upload to process again)');
     showPanel(null);
   }
 }
@@ -848,6 +1016,8 @@ function putToR2(url, file) {
 }
 
 function showDiagnostics(data) {
+  currentFilename = data.filename;
+  currentFileSizeMb = data.file_size_mb;
   diagFileName.textContent = data.filename + '  (' + data.file_size_mb.toFixed(1) + ' MB)';
   const checks = data.checks;
   const rec = data.recommended_mode;
@@ -971,6 +1141,18 @@ function showResults(result) {
   new QRCode(qrCode, { text: fullUrl, width: 160, height: 160,
     colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.L });
 
+  // Remember this job so it can be re-downloaded or re-processed without a
+  // re-upload. localStorage only — nothing is sent to the server.
+  recordJob({
+    jobId: result.id,
+    filename: currentFilename || result.output_name,
+    fileSizeMb: currentFileSizeMb,
+    mode: result.mode_used,
+    outputName: result.output_name,
+    downloadUrl: result.download_url,
+    ts: Date.now(),
+  });
+
   showPanel('resultPanel');
 }
 
@@ -978,6 +1160,9 @@ function showError(msg) {
   errorText.textContent = msg;
   errorText.classList.add('visible');
 }
+
+// Show any saved jobs on load (idle state).
+renderHistory(true);
 </script>
 </body>
 </html>'''
@@ -1038,11 +1223,9 @@ def analyze():
     rec = recommend_mode(checks)
     file_size = input_path.stat().st_size / (1024 * 1024)
 
-    # The local copy is the working copy now; drop the R2 input.
-    try:
-        r2.delete(key)
-    except Exception:
-        pass
+    # Keep the R2 input around (the lifecycle rule expires it later). This lets
+    # the browser re-analyze and re-process a past job from its history without
+    # re-uploading the source.
 
     return jsonify(
         id=job_id,

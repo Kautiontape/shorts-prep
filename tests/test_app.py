@@ -27,7 +27,7 @@ def test_unknown_route_returns_json_not_html(client):
     assert 'error' in resp.get_json()
 
 
-def test_analyze_downloads_probes_and_deletes_input(client, monkeypatch):
+def test_analyze_downloads_probes_and_keeps_input(client, monkeypatch):
     import app, r2
     written = {}
     def fake_download(key, path):
@@ -47,7 +47,8 @@ def test_analyze_downloads_probes_and_deletes_input(client, monkeypatch):
     assert body['id'] == 'abcdef012345'
     assert body['recommended_mode'] == 'quick_fix'
     assert written['key'] == 'inputs/abcdef012345.mp4'
-    assert deleted['key'] == 'inputs/abcdef012345.mp4'
+    # The R2 input is retained so the job can be re-processed from history.
+    assert deleted == {}
 
 
 def test_analyze_rejects_bad_job_id(client):
