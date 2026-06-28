@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from fractions import Fraction
@@ -265,6 +266,102 @@ def build_ffmpeg_cmd(mode, input_path, output_path):
             '-movflags', '+faststart',
             str(output_path),
         ]
+
+
+def _status_path(job_dir):
+    return job_dir / 'status.json'
+
+
+def _write_status(job_dir, data):
+    """Atomically record a job's state so any gunicorn worker can report it."""
+    tmp = job_dir / 'status.json.tmp'
+    tmp.write_text(json.dumps(data))
+    tmp.replace(_status_path(job_dir))
+
+
+def _read_status(job_dir):
+    try:
+        return json.loads(_status_path(job_dir).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _prune_job_files(job_dir):
+    """Drop the large media files once a job finishes, keeping status.json so
+    /status can still report the result."""
+    for f in job_dir.iterdir():
+        if f.name == 'status.json':
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _run_job(job_id, mode):
+    """Run the ffmpeg pipeline in the background, recording progress to
+    status.json. A long re-encode can far exceed Cloudflare's ~100s proxy
+    limit, so /process can't hold the request open until it's done."""
+    job_dir = UPLOAD_DIR / job_id
+    try:
+        inputs = list(job_dir.glob('input.*'))
+        if not inputs:
+            _write_status(job_dir, {'state': 'error', 'error': 'Input file not found'})
+            return
+        input_path = inputs[0]
+
+        # Probe before
+        before_probe = probe_detailed(str(input_path))
+        before_checks = run_checks(before_probe, str(input_path))
+
+        # Use original filename with -shorts suffix
+        name_file = job_dir / '.original_name'
+        if name_file.exists():
+            orig = Path(name_file.read_text().strip()).stem
+            output_name = f'{orig}-shorts.mp4'
+        else:
+            output_name = 'shorts-ready.mp4'
+        output_path = job_dir / output_name
+
+        cmd = build_ffmpeg_cmd(mode, input_path, output_path)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            _write_status(job_dir, {'state': 'error',
+                                    'error': f'ffmpeg failed: {result.stderr[-500:]}'})
+            return
+
+        # Probe after
+        after_probe = probe_detailed(str(output_path))
+        after_checks = run_checks(after_probe, str(output_path))
+        out_size = output_path.stat().st_size / (1024 * 1024)
+
+        # Store the result in R2 and hand back a presigned download URL.
+        out_key = f'outputs/{job_id}/{output_name}'
+        try:
+            r2.upload_file(output_path, out_key, content_type='video/mp4')
+        except Exception as e:
+            _write_status(job_dir, {'state': 'error', 'error': f'Could not store result: {e}'})
+            return
+        download_url = r2.presign_get(out_key, output_name)
+
+        _write_status(job_dir, {
+            'state': 'done',
+            'result': {
+                'id': job_id,
+                'output_name': output_name,
+                'mode_used': mode,
+                'before_checks': before_checks,
+                'after_checks': after_checks,
+                'file_size_mb': out_size,
+                'download_url': download_url,
+            },
+        })
+    except Exception:
+        # Don't leak internals; the traceback is logged server-side.
+        app.logger.exception('job %s failed', job_id)
+        _write_status(job_dir, {'state': 'error', 'error': 'Internal server error'})
+    finally:
+        _prune_job_files(job_dir)
 
 
 def cleanup_old_jobs(max_age=7200):
@@ -595,22 +692,51 @@ processBtn.addEventListener('click', async () => {
   procFileName.textContent = diagFileName.textContent;
   procStatus.textContent = selectedMode === 're_encode' ? 'Re-encoding (this may take a few minutes)...' : 'Processing...';
   try {
+    // Kick off processing. It runs in the background on the server so the
+    // request returns immediately (a long re-encode would otherwise blow past
+    // Cloudflare's ~100s proxy timeout and 524).
     const resp = await fetch('/process/' + currentJobId, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({mode: selectedMode}),
     });
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || 'Processing failed');
-    }
-    const result = await resp.json();
+    const start = await readJson(resp);
+    if (!resp.ok) throw new Error(start.error || ('HTTP ' + resp.status));
+
+    // Poll until the job finishes. Each poll is a quick request, so no 524.
+    const result = await pollStatus(currentJobId);
     showResults(result);
   } catch (err) {
     showError(err.message);
     showPanel(null);
   }
 });
+
+// Poll /status until the job is done or errors. Returns the result object.
+function pollStatus(jobId) {
+  const POLL_MS = 3000;
+  const MAX_MS = 30 * 60 * 1000;  // give a long re-encode up to 30 minutes
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      if (Date.now() - start > MAX_MS) {
+        reject(new Error('Processing timed out. Please try again.'));
+        return;
+      }
+      try {
+        const resp = await fetch('/status/' + jobId);
+        const data = await readJson(resp);
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.state === 'done') { resolve(data.result); return; }
+        if (data.state === 'error') { reject(new Error(data.error || 'Processing failed')); return; }
+        setTimeout(tick, POLL_MS);  // still processing
+      } catch (err) {
+        reject(err);
+      }
+    };
+    tick();
+  });
+}
 
 function resetAll() {
   showPanel(null);
@@ -939,7 +1065,6 @@ def process(job_id):
     inputs = list(job_dir.glob('input.*'))
     if not inputs:
         return jsonify(error='Input file not found'), 404
-    input_path = inputs[0]
 
     data = request.get_json(silent=True) or {}
     mode = data.get('mode', 'quick_fix')
@@ -948,50 +1073,22 @@ def process(job_id):
     if mode == 'metadata_fix' and not BSF_AVAILABLE:
         return jsonify(error='Metadata fix not available in this ffmpeg build'), 400
 
-    # Probe before
-    before_probe = probe_detailed(str(input_path))
-    before_checks = run_checks(before_probe, str(input_path))
+    # A full re-encode can run for minutes — far past Cloudflare's ~100s proxy
+    # timeout (524). Do the work in a background thread and let the browser poll
+    # /status, so every HTTP request returns immediately.
+    _write_status(job_dir, {'state': 'processing', 'mode': mode})
+    threading.Thread(target=_run_job, args=(job_id, mode), daemon=True).start()
+    return jsonify(id=job_id, state='processing'), 202
 
-    # Use original filename with -shorts suffix
-    name_file = job_dir / '.original_name'
-    if name_file.exists():
-        orig = Path(name_file.read_text().strip()).stem
-        output_name = f'{orig}-shorts.mp4'
-    else:
-        output_name = 'shorts-ready.mp4'
 
-    output_path = job_dir / output_name
-
-    cmd = build_ffmpeg_cmd(mode, input_path, output_path)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return jsonify(error=f'ffmpeg failed: {result.stderr[-500:]}'), 500
-
-    # Probe after
-    after_probe = probe_detailed(str(output_path))
-    after_checks = run_checks(after_probe, str(output_path))
-    out_size = output_path.stat().st_size / (1024 * 1024)
-
-    # Store the result in R2 and hand back a presigned download URL.
-    out_key = f'outputs/{job_id}/{output_name}'
-    try:
-        r2.upload_file(output_path, out_key, content_type='video/mp4')
-    except Exception as e:
-        return jsonify(error=f'Could not store result: {e}'), 502
-    download_url = r2.presign_get(out_key, output_name)
-
-    # Clean up local working files.
-    shutil.rmtree(job_dir, ignore_errors=True)
-
-    return jsonify(
-        id=job_id,
-        output_name=output_name,
-        mode_used=mode,
-        before_checks=before_checks,
-        after_checks=after_checks,
-        file_size_mb=out_size,
-        download_url=download_url,
-    )
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id):
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
+    st = _read_status(UPLOAD_DIR / job_id)
+    if st is None:
+        return jsonify(error='Job not found'), 404
+    return jsonify(st)
 
 
 if __name__ == '__main__':
