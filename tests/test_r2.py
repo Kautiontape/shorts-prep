@@ -1,5 +1,6 @@
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 import r2
@@ -67,3 +68,16 @@ def test_put_text_get_text_roundtrip_non_ascii(monkeypatch):
 
     r2.put_text('outputs/abcdef012346.name', 'café-shorts.mp4')
     assert r2.get_text('outputs/abcdef012346.name') == 'café-shorts.mp4'
+
+
+@mock_aws
+def test_get_text_propagates_missing_bucket_rather_than_not_found(monkeypatch):
+    """A missing bucket is a misconfiguration, not an expired object. It must
+    not be reported as NotFound, or every download link would render as
+    'expired' when the deploy is simply pointing at the wrong bucket."""
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    # Deliberately do NOT create the bucket.
+
+    with pytest.raises(ClientError):
+        r2.get_text('outputs/anything.name')

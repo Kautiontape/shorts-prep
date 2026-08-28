@@ -96,7 +96,10 @@ def get_text(key):
     try:
         obj = _client().get_object(Bucket=bucket(), Key=key)
     except ClientError as e:
-        if e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchBucket', '404'):
+        # Only a genuinely absent object is NotFound. Anything else --
+        # a missing bucket, bad credentials -- must propagate, so
+        # misconfiguration surfaces as a 500 instead of a "link expired" page.
+        if e.response['Error']['Code'] == 'NoSuchKey':
             raise NotFound(key) from e
         raise
     return obj['Body'].read().decode('utf-8')
