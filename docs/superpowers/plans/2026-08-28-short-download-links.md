@@ -391,7 +391,7 @@ EXPIRED_HTML = '''<!doctype html>
 <body>
   <div class="box">
     <h1>This link has expired</h1>
-    <p>Processed files are kept for 24 hours. Upload your video again to get a
+    <p>Processed files are kept for about a day. Upload your video again to get a
        fresh download link.</p>
   </div>
 </body>
@@ -409,9 +409,15 @@ def download_redirect(code):
     """Short link for the QR code. Re-signs on every visit, so the QR itself
     carries no credential and never goes stale while the file exists."""
     if not JOB_ID_RE.match(code):
+        # Same page as a real expiry: never reveal whether this code was
+        # ever valid. test_download_redirect_404s_are_indistinguishable
+        # enforces that the two bodies stay byte-identical.
         return _expired_page()
     try:
-        download_name = r2.get_text(f'outputs/{code}.name')
+        # Sanitize on read too. The sidecar is data fetched back from R2, and
+        # safe_download_name is idempotent, so this costs nothing and keeps the
+        # header's safety from depending on the write side remembering.
+        download_name = safe_download_name(r2.get_text(f'outputs/{code}.name'))
     except r2.NotFound:
         return _expired_page()
     url = r2.presign_get(f'outputs/{code}.mp4', download_name, expires=300)
@@ -427,7 +433,35 @@ The `Cache-Control: no-store` header is not in the design spec and is a necessar
 
 Run: `.venv/bin/python -m pytest tests/test_app.py -q -k download_redirect`
 
-Expected: `7 passed`.
+Expected: `9 passed` — the 7 above plus these two, which pin the read-side
+sanitizing:
+
+```python
+def test_download_redirect_sanitizes_the_sidecar_name(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'ev"il\r\n-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'evil-shorts.mp4'
+
+
+def test_download_redirect_falls_back_when_sidecar_is_empty(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: '   ')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'shorts-ready.mp4'
+```
 
 - [ ] **Step 5: Commit**
 
@@ -685,10 +719,10 @@ git commit -m "feat: point the QR code at the short link and raise QR error corr
 
 Run: `.venv/bin/python -m pytest -q`
 
-Expected: `32 passed`.
+Expected: `34 passed`.
 
 The arithmetic, so you can spot a silently-skipped test: 15 before this plan,
-plus 4 from Task 1, 4 from Task 2, 7 from Task 3, and 2 from Task 4 (which
+plus 4 from Task 1, 4 from Task 2, 9 from Task 3, and 2 from Task 4 (which
 rewrites one existing test in place and adds two). If the count differs,
 reconcile it before continuing rather than assuming it is fine.
 
