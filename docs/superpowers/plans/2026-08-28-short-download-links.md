@@ -137,7 +137,10 @@ def get_text(key):
     try:
         obj = _client().get_object(Bucket=bucket(), Key=key)
     except ClientError as e:
-        if e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchBucket', '404'):
+        # Only a genuinely absent object is NotFound. Anything else -- a missing
+        # bucket, bad credentials -- must propagate, so misconfiguration surfaces
+        # as a 500 instead of a "link expired" page.
+        if e.response['Error']['Code'] == 'NoSuchKey':
             raise NotFound(key) from e
         raise
     return obj['Body'].read().decode('utf-8')
@@ -149,7 +152,26 @@ Note the typed `NotFound` exception. The route in Task 3 must distinguish "this 
 
 Run: `.venv/bin/python -m pytest tests/test_r2.py -q`
 
-Expected: `6 passed`.
+Expected: `7 passed` (6 from the plan's tests plus the missing-bucket regression test below).
+
+Also add this regression test, which pins the narrow error-code set. Without it,
+widening the set back to `NoSuchBucket` would pass silently and turn every
+misconfigured deploy into a friendly "link expired" page:
+
+```python
+@mock_aws
+def test_get_text_propagates_missing_bucket_rather_than_not_found(monkeypatch):
+    """A missing bucket is a misconfiguration, not an expired object."""
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    # Deliberately do NOT create the bucket.
+
+    with pytest.raises(ClientError):
+        r2.get_text('outputs/anything.name')
+```
+
+This needs `from botocore.exceptions import ClientError` at the top of
+`tests/test_r2.py`.
 
 - [ ] **Step 5: Commit**
 
@@ -663,10 +685,10 @@ git commit -m "feat: point the QR code at the short link and raise QR error corr
 
 Run: `.venv/bin/python -m pytest -q`
 
-Expected: `31 passed`.
+Expected: `32 passed`.
 
 The arithmetic, so you can spot a silently-skipped test: 15 before this plan,
-plus 3 from Task 1, 4 from Task 2, 7 from Task 3, and 2 from Task 4 (which
+plus 4 from Task 1, 4 from Task 2, 7 from Task 3, and 2 from Task 4 (which
 rewrites one existing test in place and adds two). If the count differs,
 reconcile it before continuing rather than assuming it is fine.
 
