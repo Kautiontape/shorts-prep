@@ -1,4 +1,5 @@
 import boto3
+import pytest
 from moto import mock_aws
 
 import r2
@@ -36,3 +37,33 @@ def test_upload_download_delete_roundtrip(tmp_path, monkeypatch):
 
     r2.delete('inputs/x.bin')
     assert control.list_objects_v2(Bucket='test-bucket').get('KeyCount', 0) == 0
+
+
+@mock_aws
+def test_put_text_get_text_roundtrip(monkeypatch):
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    boto3.client('s3', region_name='us-east-1').create_bucket(Bucket='test-bucket')
+
+    r2.put_text('outputs/abcdef012345.name', 'clip-shorts.mp4')
+    assert r2.get_text('outputs/abcdef012345.name') == 'clip-shorts.mp4'
+
+
+@mock_aws
+def test_get_text_raises_not_found_for_missing_key(monkeypatch):
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    boto3.client('s3', region_name='us-east-1').create_bucket(Bucket='test-bucket')
+
+    with pytest.raises(r2.NotFound):
+        r2.get_text('outputs/nosuchjob.name')
+
+
+@mock_aws
+def test_put_text_get_text_roundtrip_non_ascii(monkeypatch):
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    boto3.client('s3', region_name='us-east-1').create_bucket(Bucket='test-bucket')
+
+    r2.put_text('outputs/abcdef012346.name', 'café-shorts.mp4')
+    assert r2.get_text('outputs/abcdef012346.name') == 'café-shorts.mp4'
