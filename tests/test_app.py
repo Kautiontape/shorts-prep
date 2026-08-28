@@ -374,3 +374,20 @@ def test_download_redirect_falls_back_when_sidecar_is_empty(client, monkeypatch)
 
     client.get('/d/abcdef012345')
     assert signed['name'] == 'shorts-ready.mp4'
+
+
+def test_index_html_uses_the_short_download_path():
+    """The client must read the field /process actually returns. These two
+    drifting apart is invisible server-side: every route test would still
+    pass while the result page silently rendered 'undefined' in the QR."""
+    import app
+    assert 'result.download_path' in app.HTML
+    assert 'result.download_url' not in app.HTML
+
+
+def test_index_html_raises_qr_error_correction():
+    """The old 491-char URL needed level L just to fit. The short link has
+    headroom for M, which scans far more reliably off a screen."""
+    import app
+    assert 'CorrectLevel.M' in app.HTML
+    assert 'CorrectLevel.L' not in app.HTML

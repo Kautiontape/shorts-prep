@@ -851,16 +851,17 @@ function showResults(result) {
   // Fix grid to 3 cols: label, before, after
   baGrid.style.gridTemplateColumns = 'auto 1fr 1fr';
 
-  // Download link (presigned R2 GET URL)
-  const fullUrl = result.download_url;
+  // Download link — short path on this origin; /d/<id> redirects to R2.
+  const fullUrl = location.origin + result.download_path;
   downloadBtn.href = fullUrl;
   downloadBtn.download = result.output_name;
   linkUrl.textContent = fullUrl;
 
-  // QR code
+  // QR code. At ~45 chars this fits a version-4 symbol (33x33 modules) even at
+  // the M error-correction level, versus 89x89 for the old presigned URL.
   qrCode.innerHTML = '';
   new QRCode(qrCode, { text: fullUrl, width: 160, height: 160,
-    colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.L });
+    colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.M });
 
   showPanel('resultPanel');
 }
