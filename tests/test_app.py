@@ -72,7 +72,7 @@ def _seed_job(app, job_id='abcdef012345', orig='clip.mp4'):
     return job_dir
 
 
-def test_process_uploads_result_and_returns_download_url(client, monkeypatch):
+def test_process_uploads_result_and_returns_short_path(client, monkeypatch):
     import app, r2
     job_dir = _seed_job(app)
 
@@ -86,18 +86,68 @@ def test_process_uploads_result_and_returns_download_url(client, monkeypatch):
     monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
     fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
     monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
-    uploaded = {}
+    uploaded, texts = {}, {}
     monkeypatch.setattr(r2, 'upload_file',
                         lambda path, key, content_type='application/octet-stream': uploaded.update(key=key))
-    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: f'https://signed/{key}')
+    monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
 
     resp = client.post('/process/abcdef012345', json={'mode': 'quick_fix'})
     assert resp.status_code == 200
     body = resp.get_json()
     assert body['output_name'] == 'clip-shorts.mp4'
-    assert uploaded['key'] == 'outputs/abcdef012345/clip-shorts.mp4'
-    assert body['download_url'] == 'https://signed/outputs/abcdef012345/clip-shorts.mp4'
+    assert uploaded['key'] == 'outputs/abcdef012345.mp4'
+    assert texts == {'outputs/abcdef012345.name': 'clip-shorts.mp4'}
+    assert body['download_path'] == '/d/abcdef012345'
+    assert 'download_url' not in body
     assert not job_dir.exists()  # local temp cleaned up
+
+
+def test_process_sanitizes_the_stored_download_name(client, monkeypatch):
+    import app, r2
+    _seed_job(app, job_id='abcdef012399', orig='my "weird" clip.mp4')
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+    texts = {}
+    monkeypatch.setattr(r2, 'upload_file',
+                        lambda path, key, content_type='application/octet-stream': None)
+    monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
+
+    resp = client.post('/process/abcdef012399', json={'mode': 'quick_fix'})
+    assert resp.status_code == 200
+    assert texts['outputs/abcdef012399.name'] == 'my weird clip-shorts.mp4'
+
+
+def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
+    import app, r2
+    _seed_job(app, job_id='abcdef0123aa')
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+    monkeypatch.setattr(r2, 'upload_file',
+                        lambda path, key, content_type='application/octet-stream': None)
+    def boom(key, text):
+        raise RuntimeError('r2 down')
+    monkeypatch.setattr(r2, 'put_text', boom)
+
+    resp = client.post('/process/abcdef0123aa', json={'mode': 'quick_fix'})
+    assert resp.status_code == 502
 
 
 def test_process_invalid_mode_returns_400(client):

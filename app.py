@@ -46,6 +46,8 @@ ALLOWED_EXT = {'.mov', '.mp4'}
 # backslash path separator that Path().name does not strip on POSIX.
 _UNSAFE_NAME_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
 
+DEFAULT_DOWNLOAD_NAME = 'shorts-ready.mp4'
+
 
 def safe_download_name(name):
     """Make a user-supplied filename safe to embed in Content-Disposition.
@@ -55,7 +57,7 @@ def safe_download_name(name):
     the cleaned result is never empty in practice.
     """
     cleaned = _UNSAFE_NAME_CHARS.sub('', Path(name).name).strip()
-    return cleaned or 'shorts-ready.mp4'
+    return cleaned or DEFAULT_DOWNLOAD_NAME
 
 # Labels for the compatibility checks
 CHECK_LABELS = {
@@ -1022,9 +1024,9 @@ def process(job_id):
     name_file = job_dir / '.original_name'
     if name_file.exists():
         orig = Path(name_file.read_text().strip()).stem
-        output_name = f'{orig}-shorts.mp4'
+        output_name = safe_download_name(f'{orig}-shorts.mp4')
     else:
-        output_name = 'shorts-ready.mp4'
+        output_name = DEFAULT_DOWNLOAD_NAME
 
     output_path = job_dir / output_name
 
@@ -1038,13 +1040,13 @@ def process(job_id):
     after_checks = run_checks(after_probe, str(output_path))
     out_size = output_path.stat().st_size / (1024 * 1024)
 
-    # Store the result in R2 and hand back a presigned download URL.
-    out_key = f'outputs/{job_id}/{output_name}'
+    # Store the result in R2 under a key derivable from job_id alone, plus a
+    # sidecar holding the display name. /d/<job_id> re-signs from those two.
     try:
-        r2.upload_file(output_path, out_key, content_type='video/mp4')
+        r2.upload_file(output_path, f'outputs/{job_id}.mp4', content_type='video/mp4')
+        r2.put_text(f'outputs/{job_id}.name', output_name)
     except Exception as e:
         return jsonify(error=f'Could not store result: {e}'), 502
-    download_url = r2.presign_get(out_key, output_name)
 
     # Clean up local working files.
     shutil.rmtree(job_dir, ignore_errors=True)
@@ -1056,7 +1058,7 @@ def process(job_id):
         before_checks=before_checks,
         after_checks=after_checks,
         file_size_mb=out_size,
-        download_url=download_url,
+        download_path=f'/d/{job_id}',
     )
 
 
