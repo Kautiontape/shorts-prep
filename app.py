@@ -8,7 +8,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import r2
 
 app = Flask(__name__)
@@ -23,7 +23,10 @@ def _json_http_error(e):
 
 @app.errorhandler(Exception)
 def _json_error(e):
-    # Flask logs the traceback server-side; don't leak internals to the client.
+    # Registering a handler for Exception stops Flask from logging the
+    # traceback itself, so log it here -- otherwise a 500 reaches the operator
+    # with no cause. The client still gets a generic message, no internals.
+    app.logger.exception('Unhandled error: %s', e)
     return jsonify(error='Internal server error', status=500), 500
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'
@@ -41,6 +44,23 @@ STANDARD_FRAMERATES = {24, 25, 30, 48, 50, 60}
 
 JOB_ID_RE = re.compile(r'^[0-9a-f]{12}$')
 ALLOWED_EXT = {'.mov', '.mp4'}
+
+# Characters that would corrupt a Content-Disposition header, plus the
+# backslash path separator that Path().name does not strip on POSIX.
+_UNSAFE_NAME_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
+
+DEFAULT_DOWNLOAD_NAME = 'shorts-ready.mp4'
+
+
+def safe_download_name(name):
+    """Make a user-supplied filename safe to embed in Content-Disposition.
+
+    The fallback is a defensive backstop, not a reachable path: the only
+    caller appends a literal '-shorts.mp4', which survives sanitizing, so
+    the cleaned result is never empty in practice.
+    """
+    cleaned = _UNSAFE_NAME_CHARS.sub('', Path(name).name).strip()
+    return cleaned or DEFAULT_DOWNLOAD_NAME
 
 # Labels for the compatibility checks
 CHECK_LABELS = {
@@ -834,16 +854,17 @@ function showResults(result) {
   // Fix grid to 3 cols: label, before, after
   baGrid.style.gridTemplateColumns = 'auto 1fr 1fr';
 
-  // Download link (presigned R2 GET URL)
-  const fullUrl = result.download_url;
+  // Download link — short path on this origin; /d/<id> redirects to R2.
+  const fullUrl = location.origin + result.download_path;
   downloadBtn.href = fullUrl;
   downloadBtn.download = result.output_name;
   linkUrl.textContent = fullUrl;
 
-  // QR code
+  // QR code. At ~45 chars this fits a version-4 symbol (33x33 modules) even at
+  // the M error-correction level, versus 89x89 for the old presigned URL.
   qrCode.innerHTML = '';
   new QRCode(qrCode, { text: fullUrl, width: 160, height: 160,
-    colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.L });
+    colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.M });
 
   showPanel('resultPanel');
 }
@@ -864,6 +885,57 @@ function showError(msg) {
 @app.route('/')
 def index():
     return HTML
+
+
+EXPIRED_HTML = '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link expired</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #1a1a1a; color: #eee;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .box { max-width: 22rem; padding: 2rem; text-align: center; }
+  h1 { font-size: 1.25rem; margin: 0 0 0.75rem; }
+  p { margin: 0; color: #999; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>This link has expired</h1>
+    <p>Processed files are kept for about a day. Upload your video again to get a
+       fresh download link.</p>
+  </div>
+</body>
+</html>'''
+
+
+def _expired_page():
+    # Returned directly rather than via abort(404): the global HTTPException
+    # handler renders JSON, which is wrong for a page a phone browser lands on.
+    return EXPIRED_HTML, 404, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+@app.route('/d/<code>')
+def download_redirect(code):
+    """Short link for the QR code. Re-signs on every visit, so the QR itself
+    carries no credential and never goes stale while the file exists."""
+    if not JOB_ID_RE.match(code):
+        # Same page as a real expiry: never reveal whether this code was
+        # ever valid. test_download_redirect_404s_are_indistinguishable
+        # enforces that the two bodies stay byte-identical.
+        return _expired_page()
+    try:
+        download_name = safe_download_name(r2.get_text(f'outputs/{code}.name'))
+    except r2.NotFound:
+        return _expired_page()
+    url = r2.presign_get(f'outputs/{code}.mp4', download_name, expires=300)
+    resp = redirect(url, code=302)
+    # The target expires in 5 minutes; a cached 302 would outlive it.
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/create-upload', methods=['POST'])
@@ -956,9 +1028,9 @@ def process(job_id):
     name_file = job_dir / '.original_name'
     if name_file.exists():
         orig = Path(name_file.read_text().strip()).stem
-        output_name = f'{orig}-shorts.mp4'
+        output_name = safe_download_name(f'{orig}-shorts.mp4')
     else:
-        output_name = 'shorts-ready.mp4'
+        output_name = DEFAULT_DOWNLOAD_NAME
 
     output_path = job_dir / output_name
 
@@ -972,13 +1044,13 @@ def process(job_id):
     after_checks = run_checks(after_probe, str(output_path))
     out_size = output_path.stat().st_size / (1024 * 1024)
 
-    # Store the result in R2 and hand back a presigned download URL.
-    out_key = f'outputs/{job_id}/{output_name}'
+    # Store the result in R2 under a key derivable from job_id alone, plus a
+    # sidecar holding the display name. /d/<job_id> re-signs from those two.
     try:
-        r2.upload_file(output_path, out_key, content_type='video/mp4')
+        r2.upload_file(output_path, f'outputs/{job_id}.mp4', content_type='video/mp4')
+        r2.put_text(f'outputs/{job_id}.name', output_name)
     except Exception as e:
         return jsonify(error=f'Could not store result: {e}'), 502
-    download_url = r2.presign_get(out_key, output_name)
 
     # Clean up local working files.
     shutil.rmtree(job_dir, ignore_errors=True)
@@ -990,7 +1062,7 @@ def process(job_id):
         before_checks=before_checks,
         after_checks=after_checks,
         file_size_mb=out_size,
-        download_url=download_url,
+        download_path=f'/d/{job_id}',
     )
 
 

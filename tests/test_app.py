@@ -72,7 +72,7 @@ def _seed_job(app, job_id='abcdef012345', orig='clip.mp4'):
     return job_dir
 
 
-def test_process_uploads_result_and_returns_download_url(client, monkeypatch):
+def test_process_uploads_result_and_returns_short_path(client, monkeypatch):
     import app, r2
     job_dir = _seed_job(app)
 
@@ -86,18 +86,133 @@ def test_process_uploads_result_and_returns_download_url(client, monkeypatch):
     monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
     fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
     monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
-    uploaded = {}
+    uploaded, texts = {}, {}
     monkeypatch.setattr(r2, 'upload_file',
                         lambda path, key, content_type='application/octet-stream': uploaded.update(key=key))
-    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: f'https://signed/{key}')
+    monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
 
     resp = client.post('/process/abcdef012345', json={'mode': 'quick_fix'})
     assert resp.status_code == 200
     body = resp.get_json()
     assert body['output_name'] == 'clip-shorts.mp4'
-    assert uploaded['key'] == 'outputs/abcdef012345/clip-shorts.mp4'
-    assert body['download_url'] == 'https://signed/outputs/abcdef012345/clip-shorts.mp4'
+    assert uploaded['key'] == 'outputs/abcdef012345.mp4'
+    assert texts == {'outputs/abcdef012345.name': 'clip-shorts.mp4'}
+    assert body['download_path'] == '/d/abcdef012345'
+    assert 'download_url' not in body
     assert not job_dir.exists()  # local temp cleaned up
+
+
+def test_process_sanitizes_the_stored_download_name(client, monkeypatch):
+    import app, r2
+    _seed_job(app, job_id='abcdef012399', orig='my "weird" clip.mp4')
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+    texts = {}
+    monkeypatch.setattr(r2, 'upload_file',
+                        lambda path, key, content_type='application/octet-stream': None)
+    monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
+
+    resp = client.post('/process/abcdef012399', json={'mode': 'quick_fix'})
+    assert resp.status_code == 200
+    assert texts == {'outputs/abcdef012399.name': 'my weird clip-shorts.mp4'}
+
+
+def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
+    import app, r2
+    _seed_job(app, job_id='abcdef0123aa')
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+    monkeypatch.setattr(r2, 'upload_file',
+                        lambda path, key, content_type='application/octet-stream': None)
+    def boom(key, text):
+        raise RuntimeError('r2 down')
+    monkeypatch.setattr(r2, 'put_text', boom)
+
+    resp = client.post('/process/abcdef0123aa', json={'mode': 'quick_fix'})
+    assert resp.status_code == 502
+
+
+def test_process_then_download_redirect_round_trip(client, monkeypatch):
+    """The two halves of the feature must agree on the R2 key strings.
+
+    Every other test mocks one side or the other, so a divergence between what
+    /process writes and what /d/<code> reads would pass the whole suite while
+    shipping a feature that never works. This drives both routes against one
+    shared fake bucket.
+    """
+    import app, r2
+    store = {}
+
+    def fake_upload(path, key, content_type='application/octet-stream'):
+        store[key] = Path(path).read_bytes()
+    def fake_put_text(key, text):
+        store[key] = text
+    def fake_get_text(key):
+        if key not in store:
+            raise r2.NotFound(key)
+        return store[key]
+    def fake_presign(key, name, expires=86400):
+        if key not in store:
+            raise AssertionError(f'presigned a key that was never written: {key}')
+        return f'https://signed.example/{key}?name={name}'
+
+    monkeypatch.setattr(r2, 'upload_file', fake_upload)
+    monkeypatch.setattr(r2, 'put_text', fake_put_text)
+    monkeypatch.setattr(r2, 'get_text', fake_get_text)
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+
+    _seed_job(app, job_id='abcdef0123ee', orig='holiday.mp4')
+    resp = client.post('/process/abcdef0123ee', json={'mode': 'quick_fix'})
+    assert resp.status_code == 200
+    download_path = resp.get_json()['download_path']
+
+    # Follow the very path the client will put in the QR code.
+    follow = client.get(download_path)
+    assert follow.status_code == 302
+    assert follow.headers['Location'] == (
+        'https://signed.example/outputs/abcdef0123ee.mp4?name=holiday-shorts.mp4'
+    )
+
+
+def test_download_redirect_after_lifecycle_reaps_the_job(client, monkeypatch):
+    """Once the bucket lifecycle deletes the objects, the same link 404s."""
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    resp = client.get('/d/abcdef0123ee')
+    assert resp.status_code == 404
+    assert b'expired' in resp.data.lower()
 
 
 def test_process_invalid_mode_returns_400(client):
@@ -126,3 +241,195 @@ def test_download_route_removed(client):
     resp = client.get('/download/abcdef012345')
     assert resp.status_code == 404
     assert resp.get_json() is not None  # JSON 404, not HTML
+
+
+def test_safe_download_name_strips_quotes_and_control_chars():
+    import app
+    assert app.safe_download_name('my "clip"-shorts.mp4') == 'my clip-shorts.mp4'
+    assert app.safe_download_name('clip\r\n-shorts.mp4') == 'clip-shorts.mp4'
+
+
+def test_safe_download_name_strips_path_components():
+    import app
+    assert app.safe_download_name('../../etc/passwd-shorts.mp4') == 'passwd-shorts.mp4'
+    assert app.safe_download_name('a\\b-shorts.mp4') == 'ab-shorts.mp4'
+
+
+def test_safe_download_name_falls_back_when_empty():
+    import app
+    assert app.safe_download_name('""') == 'shorts-ready.mp4'
+    assert app.safe_download_name('') == 'shorts-ready.mp4'
+
+
+def test_safe_download_name_keeps_non_ascii():
+    import app
+    assert app.safe_download_name('café-shorts.mp4') == 'café-shorts.mp4'
+
+
+def test_download_redirect_302s_to_presigned_url(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'clip-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed.update(key=key, name=name, expires=expires)
+        return f'https://signed/{key}'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 302
+    assert resp.headers['Location'] == 'https://signed/outputs/abcdef012345.mp4'
+    assert signed['key'] == 'outputs/abcdef012345.mp4'
+    assert signed['name'] == 'clip-shorts.mp4'
+    assert signed['expires'] == 300
+
+
+def test_download_redirect_reads_the_name_sidecar(client, monkeypatch):
+    import app, r2
+    read = {}
+    def fake_get_text(key):
+        read['key'] = key
+        return 'clip-shorts.mp4'
+    monkeypatch.setattr(r2, 'get_text', fake_get_text)
+    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: 'https://signed/x')
+
+    client.get('/d/abcdef012345')
+    assert read['key'] == 'outputs/abcdef012345.name'
+
+
+def test_download_redirect_is_not_cacheable(client, monkeypatch):
+    import app, r2
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'clip-shorts.mp4')
+    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: 'https://signed/x')
+
+    resp = client.get('/d/abcdef012345')
+    assert 'no-store' in resp.headers['Cache-Control']
+
+
+def test_download_redirect_expired_returns_html_404(client, monkeypatch):
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 404
+    assert resp.content_type.startswith('text/html')
+    assert b'expired' in resp.data.lower()
+
+
+def test_download_redirect_malformed_code_returns_html_404(client):
+    resp = client.get('/d/NOT-A-JOB-ID')
+    assert resp.status_code == 404
+    assert resp.content_type.startswith('text/html')
+
+
+def test_download_redirect_404s_are_indistinguishable(client, monkeypatch):
+    """A bad code and an expired code must look identical, so the route
+    never reveals whether a given job ever existed."""
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    expired = client.get('/d/abcdef012345')
+    malformed = client.get('/d/NOT-A-JOB-ID')
+    assert expired.data == malformed.data
+    assert expired.status_code == malformed.status_code
+
+
+def test_download_redirect_propagates_unexpected_r2_errors(client, monkeypatch):
+    """Misconfiguration must not be silently reported as 'expired'."""
+    import app, r2
+    def boom(key):
+        raise RuntimeError('credentials are wrong')
+    monkeypatch.setattr(r2, 'get_text', boom)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 500
+
+
+def test_download_redirect_sanitizes_the_sidecar_name(client, monkeypatch):
+    """The sidecar is data read back from R2. Even though Task 4 sanitizes on
+    write, the read side must not trust it to build a Content-Disposition."""
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'ev"il\r\n-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'evil-shorts.mp4'
+
+
+def test_download_redirect_falls_back_when_sidecar_is_empty(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: '   ')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'shorts-ready.mp4'
+
+
+def test_index_html_uses_the_short_download_path():
+    """The client must read the field /process actually returns. These two
+    drifting apart is invisible server-side: every route test would still
+    pass while the result page silently rendered 'undefined' in the QR."""
+    import app
+    assert 'result.download_path' in app.HTML
+    assert 'result.download_url' not in app.HTML
+
+
+def test_index_html_raises_qr_error_correction():
+    """The old 491-char URL needed level L just to fit. The short link has
+    headroom for M, which scans far more reliably off a screen."""
+    import app
+    assert 'CorrectLevel.M' in app.HTML
+    assert 'CorrectLevel.L' not in app.HTML
+
+
+def test_internal_errors_are_logged_server_side(client, monkeypatch, caplog):
+    """Registering an errorhandler for Exception stops Flask logging the
+    traceback itself, so the handler must log it. Without this the /d/ route's
+    deliberate 'misconfiguration surfaces as a 500' behavior is invisible in
+    production -- the operator sees a generic 500 and no cause.
+    """
+    import app, r2
+    def boom(key):
+        raise RuntimeError('diagnostic-marker-xyz')
+    monkeypatch.setattr(r2, 'get_text', boom)
+
+    with caplog.at_level('ERROR'):
+        resp = client.get('/d/abcdef012345')
+
+    assert resp.status_code == 500
+    assert resp.get_json()['error'] == 'Internal server error'  # still no leak
+    assert 'diagnostic-marker-xyz' in caplog.text
+
+
+# QR byte-mode capacity at error-correction level M. Version 4 (33x33 modules)
+# holds 62 bytes; version 5 jumps to 37x37 and starts shrinking each module
+# below the ~4.8px that makes the code scannable on the 160px canvas.
+QR_V4_M_CAPACITY = 62
+
+SHORT_LINK_ORIGIN = 'https://shorts.kautiontape.com'
+
+
+def test_short_link_stays_within_one_qr_version():
+    """The whole feature exists to keep the QR scannable. Nothing else pins
+    the length that justification rests on, so a longer domain, an extra query
+    parameter, or a wider job id could silently push the code to a denser
+    version and only be noticed when a phone failed to scan it.
+    """
+    import app
+    job_id = 'a' * 12  # job_id is uuid4().hex[:12]
+    assert app.JOB_ID_RE.match(job_id)  # the path shape really is this wide
+    url = f'{SHORT_LINK_ORIGIN}/d/{job_id}'
+    assert len(url.encode()) <= QR_V4_M_CAPACITY, (
+        f'{len(url)}-byte link exceeds QR v4-M capacity; the QR would get denser'
+    )

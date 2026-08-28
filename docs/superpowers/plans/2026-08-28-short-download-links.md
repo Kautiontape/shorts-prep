@@ -137,7 +137,10 @@ def get_text(key):
     try:
         obj = _client().get_object(Bucket=bucket(), Key=key)
     except ClientError as e:
-        if e.response['Error']['Code'] in ('NoSuchKey', 'NoSuchBucket', '404'):
+        # Only a genuinely absent object is NotFound. Anything else -- a missing
+        # bucket, bad credentials -- must propagate, so misconfiguration surfaces
+        # as a 500 instead of a "link expired" page.
+        if e.response['Error']['Code'] == 'NoSuchKey':
             raise NotFound(key) from e
         raise
     return obj['Body'].read().decode('utf-8')
@@ -149,7 +152,26 @@ Note the typed `NotFound` exception. The route in Task 3 must distinguish "this 
 
 Run: `.venv/bin/python -m pytest tests/test_r2.py -q`
 
-Expected: `6 passed`.
+Expected: `7 passed` (6 from the plan's tests plus the missing-bucket regression test below).
+
+Also add this regression test, which pins the narrow error-code set. Without it,
+widening the set back to `NoSuchBucket` would pass silently and turn every
+misconfigured deploy into a friendly "link expired" page:
+
+```python
+@mock_aws
+def test_get_text_propagates_missing_bucket_rather_than_not_found(monkeypatch):
+    """A missing bucket is a misconfiguration, not an expired object."""
+    monkeypatch.setenv('R2_ENDPOINT', '')
+    monkeypatch.setenv('R2_REGION', 'us-east-1')
+    # Deliberately do NOT create the bucket.
+
+    with pytest.raises(ClientError):
+        r2.get_text('outputs/anything.name')
+```
+
+This needs `from botocore.exceptions import ClientError` at the top of
+`tests/test_r2.py`.
 
 - [ ] **Step 5: Commit**
 
@@ -369,7 +391,7 @@ EXPIRED_HTML = '''<!doctype html>
 <body>
   <div class="box">
     <h1>This link has expired</h1>
-    <p>Processed files are kept for 24 hours. Upload your video again to get a
+    <p>Processed files are kept for about a day. Upload your video again to get a
        fresh download link.</p>
   </div>
 </body>
@@ -387,9 +409,15 @@ def download_redirect(code):
     """Short link for the QR code. Re-signs on every visit, so the QR itself
     carries no credential and never goes stale while the file exists."""
     if not JOB_ID_RE.match(code):
+        # Same page as a real expiry: never reveal whether this code was
+        # ever valid. test_download_redirect_404s_are_indistinguishable
+        # enforces that the two bodies stay byte-identical.
         return _expired_page()
     try:
-        download_name = r2.get_text(f'outputs/{code}.name')
+        # Sanitize on read too. The sidecar is data fetched back from R2, and
+        # safe_download_name is idempotent, so this costs nothing and keeps the
+        # header's safety from depending on the write side remembering.
+        download_name = safe_download_name(r2.get_text(f'outputs/{code}.name'))
     except r2.NotFound:
         return _expired_page()
     url = r2.presign_get(f'outputs/{code}.mp4', download_name, expires=300)
@@ -405,7 +433,35 @@ The `Cache-Control: no-store` header is not in the design spec and is a necessar
 
 Run: `.venv/bin/python -m pytest tests/test_app.py -q -k download_redirect`
 
-Expected: `7 passed`.
+Expected: `9 passed` — the 7 above plus these two, which pin the read-side
+sanitizing:
+
+```python
+def test_download_redirect_sanitizes_the_sidecar_name(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'ev"il\r\n-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'evil-shorts.mp4'
+
+
+def test_download_redirect_falls_back_when_sidecar_is_empty(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: '   ')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'shorts-ready.mp4'
+```
 
 - [ ] **Step 5: Commit**
 
@@ -663,12 +719,14 @@ git commit -m "feat: point the QR code at the short link and raise QR error corr
 
 Run: `.venv/bin/python -m pytest -q`
 
-Expected: `31 passed`.
+Expected: `40 passed`.
 
 The arithmetic, so you can spot a silently-skipped test: 15 before this plan,
-plus 3 from Task 1, 4 from Task 2, 7 from Task 3, and 2 from Task 4 (which
-rewrites one existing test in place and adds two). If the count differs,
-reconcile it before continuing rather than assuming it is fine.
+plus 4 from Task 1, 4 from Task 2, 9 from Task 3, 4 from Task 4 (one existing
+test rewritten in place, plus the round-trip pair), 2 from Task 5, and 2 added
+during verification (`tests/test_e2e_moto.py` and the error-logging test). If
+the count differs, reconcile it before continuing rather than assuming it is
+fine.
 
 - [ ] **Step 2: Confirm the URL is actually short**
 
@@ -726,3 +784,50 @@ git commit -m "fix: <what was actually wrong>"
 - **Do not broaden the `except r2.NotFound` to `except Exception`.** `test_download_redirect_propagates_unexpected_r2_errors` enforces this; a bare catch would report a credentials failure as an expired link.
 - **`setup_r2.py` needs no change.** Its lifecycle rule uses `Prefix: ''`, so it already covers both `outputs/<id>.mp4` and `outputs/<id>.name`, which are written together and therefore expire together.
 - **Links created before this deploy will break**, since the key layout changes. This is expected — jobs live at most ~48 hours under the current 1-day lifecycle rule.
+
+
+---
+
+## Changes made during execution
+
+Recorded here so the plan matches what shipped. Each came from a review finding
+during implementation, not from the original design.
+
+1. **`r2.NotFound` narrowed to `NoSuchKey` only.** The plan originally caught
+   `('NoSuchKey', 'NoSuchBucket', '404')`. Catching `NoSuchBucket` meant a
+   misconfigured bucket would render as a friendly "link expired" page instead
+   of surfacing as a 500 -- exactly the failure mode the design set out to
+   prevent. Cloudflare's published R2 error codes confirm `NoSuchKey` and
+   `NoSuchBucket` are distinct, so the narrow set is correct rather than merely
+   safer. Pinned by `test_get_text_propagates_missing_bucket_rather_than_not_found`.
+
+2. **`/d/<code>` sanitizes the sidecar on read.** The route now wraps
+   `r2.get_text(...)` in `safe_download_name(...)`. The sidecar is data read
+   back from R2; `safe_download_name` is idempotent, so this costs nothing and
+   stops the header's safety from depending on the write side remembering.
+
+3. **The malformed-code branch carries a comment** explaining that showing the
+   expired page is deliberate, so a future maintainer does not "fix" it into a
+   distinct response and reopen the job-id enumeration side-channel.
+
+4. **`DEFAULT_DOWNLOAD_NAME` extracted**, replacing two copies of the
+   `'shorts-ready.mp4'` literal.
+
+5. **Retention copy corrected** from "kept for 24 hours" to "kept for about a
+   day". The lifecycle rule guarantees a *minimum* of ~24h; deletion can lag to
+   ~48h under daily-batch semantics.
+
+6. **Two cross-cutting tests added.** Every other test mocks one half of the
+   feature, so a divergence between the key `/process` writes and the key `/d/`
+   reads would pass the whole suite while shipping something that never works.
+   `test_process_then_download_redirect_round_trip` drives both routes against
+   one shared fake store; `tests/test_e2e_moto.py` does the same through the
+   *real* `r2` functions against moto, additionally asserting the objects land
+   under the expected keys. Both were mutation-tested against a deliberate key
+   divergence and confirmed to fail.
+
+7. **The generic error handler now logs the traceback.** Registering
+   `@app.errorhandler(Exception)` stops Flask logging it, so the 500 that this
+   feature deliberately produces for a misconfigured R2 was arriving with no
+   diagnostic trace. Pre-existing, but it defeated a design decision central to
+   this change. The client still receives only a generic message.

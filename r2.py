@@ -11,6 +11,11 @@ import os
 
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
+
+
+class NotFound(Exception):
+    """Object does not exist — typically reaped by the bucket lifecycle rule."""
 
 
 def _settings():
@@ -74,3 +79,27 @@ def upload_file(local_path, key, content_type='application/octet-stream'):
 
 def delete(key):
     _client().delete_object(Bucket=bucket(), Key=key)
+
+
+def put_text(key, text):
+    """Store a small UTF-8 text object (used for download-name sidecars)."""
+    _client().put_object(
+        Bucket=bucket(),
+        Key=key,
+        Body=text.encode('utf-8'),
+        ContentType='text/plain; charset=utf-8',
+    )
+
+
+def get_text(key):
+    """Read a small UTF-8 text object. Raises NotFound if the key is gone."""
+    try:
+        obj = _client().get_object(Bucket=bucket(), Key=key)
+    except ClientError as e:
+        # Only a genuinely absent object is NotFound. Anything else --
+        # a missing bucket, bad credentials -- must propagate, so
+        # misconfiguration surfaces as a 500 instead of a "link expired" page.
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise NotFound(key) from e
+        raise
+    return obj['Body'].read().decode('utf-8')
