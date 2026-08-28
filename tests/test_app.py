@@ -123,7 +123,7 @@ def test_process_sanitizes_the_stored_download_name(client, monkeypatch):
 
     resp = client.post('/process/abcdef012399', json={'mode': 'quick_fix'})
     assert resp.status_code == 200
-    assert texts['outputs/abcdef012399.name'] == 'my weird clip-shorts.mp4'
+    assert texts == {'outputs/abcdef012399.name': 'my weird clip-shorts.mp4'}
 
 
 def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
@@ -148,6 +148,71 @@ def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
 
     resp = client.post('/process/abcdef0123aa', json={'mode': 'quick_fix'})
     assert resp.status_code == 502
+
+
+def test_process_then_download_redirect_round_trip(client, monkeypatch):
+    """The two halves of the feature must agree on the R2 key strings.
+
+    Every other test mocks one side or the other, so a divergence between what
+    /process writes and what /d/<code> reads would pass the whole suite while
+    shipping a feature that never works. This drives both routes against one
+    shared fake bucket.
+    """
+    import app, r2
+    store = {}
+
+    def fake_upload(path, key, content_type='application/octet-stream'):
+        store[key] = Path(path).read_bytes()
+    def fake_put_text(key, text):
+        store[key] = text
+    def fake_get_text(key):
+        if key not in store:
+            raise r2.NotFound(key)
+        return store[key]
+    def fake_presign(key, name, expires=86400):
+        if key not in store:
+            raise AssertionError(f'presigned a key that was never written: {key}')
+        return f'https://signed.example/{key}?name={name}'
+
+    monkeypatch.setattr(r2, 'upload_file', fake_upload)
+    monkeypatch.setattr(r2, 'put_text', fake_put_text)
+    monkeypatch.setattr(r2, 'get_text', fake_get_text)
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    def fake_run(cmd, capture_output=True, text=True):
+        Path(cmd[-1]).write_bytes(b'\x00' * 20)
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', fake_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    fake_checks = {k: {'ok': True, 'value': 'x', 'expected': 'x'} for k in app.CHECK_LABELS}
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
+
+    _seed_job(app, job_id='abcdef0123ee', orig='holiday.mp4')
+    resp = client.post('/process/abcdef0123ee', json={'mode': 'quick_fix'})
+    assert resp.status_code == 200
+    download_path = resp.get_json()['download_path']
+
+    # Follow the very path the client will put in the QR code.
+    follow = client.get(download_path)
+    assert follow.status_code == 302
+    assert follow.headers['Location'] == (
+        'https://signed.example/outputs/abcdef0123ee.mp4?name=holiday-shorts.mp4'
+    )
+
+
+def test_download_redirect_after_lifecycle_reaps_the_job(client, monkeypatch):
+    """Once the bucket lifecycle deletes the objects, the same link 404s."""
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    resp = client.get('/d/abcdef0123ee')
+    assert resp.status_code == 404
+    assert b'expired' in resp.data.lower()
 
 
 def test_process_invalid_mode_returns_400(client):
