@@ -719,12 +719,14 @@ git commit -m "feat: point the QR code at the short link and raise QR error corr
 
 Run: `.venv/bin/python -m pytest -q`
 
-Expected: `34 passed`.
+Expected: `40 passed`.
 
 The arithmetic, so you can spot a silently-skipped test: 15 before this plan,
-plus 4 from Task 1, 4 from Task 2, 9 from Task 3, and 2 from Task 4 (which
-rewrites one existing test in place and adds two). If the count differs,
-reconcile it before continuing rather than assuming it is fine.
+plus 4 from Task 1, 4 from Task 2, 9 from Task 3, 4 from Task 4 (one existing
+test rewritten in place, plus the round-trip pair), 2 from Task 5, and 2 added
+during verification (`tests/test_e2e_moto.py` and the error-logging test). If
+the count differs, reconcile it before continuing rather than assuming it is
+fine.
 
 - [ ] **Step 2: Confirm the URL is actually short**
 
@@ -782,3 +784,50 @@ git commit -m "fix: <what was actually wrong>"
 - **Do not broaden the `except r2.NotFound` to `except Exception`.** `test_download_redirect_propagates_unexpected_r2_errors` enforces this; a bare catch would report a credentials failure as an expired link.
 - **`setup_r2.py` needs no change.** Its lifecycle rule uses `Prefix: ''`, so it already covers both `outputs/<id>.mp4` and `outputs/<id>.name`, which are written together and therefore expire together.
 - **Links created before this deploy will break**, since the key layout changes. This is expected — jobs live at most ~48 hours under the current 1-day lifecycle rule.
+
+
+---
+
+## Changes made during execution
+
+Recorded here so the plan matches what shipped. Each came from a review finding
+during implementation, not from the original design.
+
+1. **`r2.NotFound` narrowed to `NoSuchKey` only.** The plan originally caught
+   `('NoSuchKey', 'NoSuchBucket', '404')`. Catching `NoSuchBucket` meant a
+   misconfigured bucket would render as a friendly "link expired" page instead
+   of surfacing as a 500 -- exactly the failure mode the design set out to
+   prevent. Cloudflare's published R2 error codes confirm `NoSuchKey` and
+   `NoSuchBucket` are distinct, so the narrow set is correct rather than merely
+   safer. Pinned by `test_get_text_propagates_missing_bucket_rather_than_not_found`.
+
+2. **`/d/<code>` sanitizes the sidecar on read.** The route now wraps
+   `r2.get_text(...)` in `safe_download_name(...)`. The sidecar is data read
+   back from R2; `safe_download_name` is idempotent, so this costs nothing and
+   stops the header's safety from depending on the write side remembering.
+
+3. **The malformed-code branch carries a comment** explaining that showing the
+   expired page is deliberate, so a future maintainer does not "fix" it into a
+   distinct response and reopen the job-id enumeration side-channel.
+
+4. **`DEFAULT_DOWNLOAD_NAME` extracted**, replacing two copies of the
+   `'shorts-ready.mp4'` literal.
+
+5. **Retention copy corrected** from "kept for 24 hours" to "kept for about a
+   day". The lifecycle rule guarantees a *minimum* of ~24h; deletion can lag to
+   ~48h under daily-batch semantics.
+
+6. **Two cross-cutting tests added.** Every other test mocks one half of the
+   feature, so a divergence between the key `/process` writes and the key `/d/`
+   reads would pass the whole suite while shipping something that never works.
+   `test_process_then_download_redirect_round_trip` drives both routes against
+   one shared fake store; `tests/test_e2e_moto.py` does the same through the
+   *real* `r2` functions against moto, additionally asserting the objects land
+   under the expected keys. Both were mutation-tested against a deliberate key
+   divergence and confirmed to fail.
+
+7. **The generic error handler now logs the traceback.** Registering
+   `@app.errorhandler(Exception)` stops Flask logging it, so the 500 that this
+   feature deliberately produces for a misconfigured R2 was arriving with no
+   diagnostic trace. Pre-existing, but it defeated a design decision central to
+   this change. The client still receives only a generic message.
