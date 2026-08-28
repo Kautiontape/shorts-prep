@@ -149,3 +149,85 @@ def test_safe_download_name_falls_back_when_empty():
 def test_safe_download_name_keeps_non_ascii():
     import app
     assert app.safe_download_name('café-shorts.mp4') == 'café-shorts.mp4'
+
+
+def test_download_redirect_302s_to_presigned_url(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'clip-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed.update(key=key, name=name, expires=expires)
+        return f'https://signed/{key}'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 302
+    assert resp.headers['Location'] == 'https://signed/outputs/abcdef012345.mp4'
+    assert signed['key'] == 'outputs/abcdef012345.mp4'
+    assert signed['name'] == 'clip-shorts.mp4'
+    assert signed['expires'] == 300
+
+
+def test_download_redirect_reads_the_name_sidecar(client, monkeypatch):
+    import app, r2
+    read = {}
+    def fake_get_text(key):
+        read['key'] = key
+        return 'clip-shorts.mp4'
+    monkeypatch.setattr(r2, 'get_text', fake_get_text)
+    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: 'https://signed/x')
+
+    client.get('/d/abcdef012345')
+    assert read['key'] == 'outputs/abcdef012345.name'
+
+
+def test_download_redirect_is_not_cacheable(client, monkeypatch):
+    import app, r2
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'clip-shorts.mp4')
+    monkeypatch.setattr(r2, 'presign_get', lambda key, name, expires=86400: 'https://signed/x')
+
+    resp = client.get('/d/abcdef012345')
+    assert 'no-store' in resp.headers['Cache-Control']
+
+
+def test_download_redirect_expired_returns_html_404(client, monkeypatch):
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 404
+    assert resp.content_type.startswith('text/html')
+    assert b'expired' in resp.data.lower()
+
+
+def test_download_redirect_malformed_code_returns_html_404(client):
+    resp = client.get('/d/NOT-A-JOB-ID')
+    assert resp.status_code == 404
+    assert resp.content_type.startswith('text/html')
+
+
+def test_download_redirect_404s_are_indistinguishable(client, monkeypatch):
+    """A bad code and an expired code must look identical, so the route
+    never reveals whether a given job ever existed."""
+    import app, r2
+    def raise_not_found(key):
+        raise r2.NotFound(key)
+    monkeypatch.setattr(r2, 'get_text', raise_not_found)
+
+    expired = client.get('/d/abcdef012345')
+    malformed = client.get('/d/NOT-A-JOB-ID')
+    assert expired.data == malformed.data
+    assert expired.status_code == malformed.status_code
+
+
+def test_download_redirect_propagates_unexpected_r2_errors(client, monkeypatch):
+    """Misconfiguration must not be silently reported as 'expired'."""
+    import app, r2
+    def boom(key):
+        raise RuntimeError('credentials are wrong')
+    monkeypatch.setattr(r2, 'get_text', boom)
+
+    resp = client.get('/d/abcdef012345')
+    assert resp.status_code == 500

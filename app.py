@@ -8,7 +8,7 @@ import uuid
 from fractions import Fraction
 from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import r2
 
 app = Flask(__name__)
@@ -879,6 +879,54 @@ function showError(msg) {
 @app.route('/')
 def index():
     return HTML
+
+
+EXPIRED_HTML = '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Link expired</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #1a1a1a; color: #eee;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .box { max-width: 22rem; padding: 2rem; text-align: center; }
+  h1 { font-size: 1.25rem; margin: 0 0 0.75rem; }
+  p { margin: 0; color: #999; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>This link has expired</h1>
+    <p>Processed files are kept for 24 hours. Upload your video again to get a
+       fresh download link.</p>
+  </div>
+</body>
+</html>'''
+
+
+def _expired_page():
+    # Returned directly rather than via abort(404): the global HTTPException
+    # handler renders JSON, which is wrong for a page a phone browser lands on.
+    return EXPIRED_HTML, 404, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+@app.route('/d/<code>')
+def download_redirect(code):
+    """Short link for the QR code. Re-signs on every visit, so the QR itself
+    carries no credential and never goes stale while the file exists."""
+    if not JOB_ID_RE.match(code):
+        return _expired_page()
+    try:
+        download_name = r2.get_text(f'outputs/{code}.name')
+    except r2.NotFound:
+        return _expired_page()
+    url = r2.presign_get(f'outputs/{code}.mp4', download_name, expires=300)
+    resp = redirect(url, code=302)
+    # The target expires in 5 minutes; a cached 302 would outlive it.
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/create-upload', methods=['POST'])
