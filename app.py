@@ -48,7 +48,12 @@ _UNSAFE_NAME_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
 
 
 def safe_download_name(name):
-    """Make a user-supplied filename safe to embed in Content-Disposition."""
+    """Make a user-supplied filename safe to embed in Content-Disposition.
+
+    The fallback is a defensive backstop, not a reachable path: the only
+    caller appends a literal '-shorts.mp4', which survives sanitizing, so
+    the cleaned result is never empty in practice.
+    """
     cleaned = _UNSAFE_NAME_CHARS.sub('', Path(name).name).strip()
     return cleaned or 'shorts-ready.mp4'
 
