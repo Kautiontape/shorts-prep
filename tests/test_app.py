@@ -410,3 +410,26 @@ def test_internal_errors_are_logged_server_side(client, monkeypatch, caplog):
     assert resp.status_code == 500
     assert resp.get_json()['error'] == 'Internal server error'  # still no leak
     assert 'diagnostic-marker-xyz' in caplog.text
+
+
+# QR byte-mode capacity at error-correction level M. Version 4 (33x33 modules)
+# holds 62 bytes; version 5 jumps to 37x37 and starts shrinking each module
+# below the ~4.8px that makes the code scannable on the 160px canvas.
+QR_V4_M_CAPACITY = 62
+
+SHORT_LINK_ORIGIN = 'https://shorts.kautiontape.com'
+
+
+def test_short_link_stays_within_one_qr_version():
+    """The whole feature exists to keep the QR scannable. Nothing else pins
+    the length that justification rests on, so a longer domain, an extra query
+    parameter, or a wider job id could silently push the code to a denser
+    version and only be noticed when a phone failed to scan it.
+    """
+    import app
+    job_id = 'a' * 12  # job_id is uuid4().hex[:12]
+    assert app.JOB_ID_RE.match(job_id)  # the path shape really is this wide
+    url = f'{SHORT_LINK_ORIGIN}/d/{job_id}'
+    assert len(url.encode()) <= QR_V4_M_CAPACITY, (
+        f'{len(url)}-byte link exceeds QR v4-M capacity; the QR would get denser'
+    )
