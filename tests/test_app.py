@@ -126,3 +126,26 @@ def test_download_route_removed(client):
     resp = client.get('/download/abcdef012345')
     assert resp.status_code == 404
     assert resp.get_json() is not None  # JSON 404, not HTML
+
+
+def test_safe_download_name_strips_quotes_and_control_chars():
+    import app
+    assert app.safe_download_name('my "clip"-shorts.mp4') == 'my clip-shorts.mp4'
+    assert app.safe_download_name('clip\r\n-shorts.mp4') == 'clip-shorts.mp4'
+
+
+def test_safe_download_name_strips_path_components():
+    import app
+    assert app.safe_download_name('../../etc/passwd-shorts.mp4') == 'passwd-shorts.mp4'
+    assert app.safe_download_name('a\\b-shorts.mp4') == 'ab-shorts.mp4'
+
+
+def test_safe_download_name_falls_back_when_empty():
+    import app
+    assert app.safe_download_name('""') == 'shorts-ready.mp4'
+    assert app.safe_download_name('') == 'shorts-ready.mp4'
+
+
+def test_safe_download_name_keeps_non_ascii():
+    import app
+    assert app.safe_download_name('café-shorts.mp4') == 'café-shorts.mp4'

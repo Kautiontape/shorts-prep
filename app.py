@@ -42,6 +42,16 @@ STANDARD_FRAMERATES = {24, 25, 30, 48, 50, 60}
 JOB_ID_RE = re.compile(r'^[0-9a-f]{12}$')
 ALLOWED_EXT = {'.mov', '.mp4'}
 
+# Characters that would corrupt a Content-Disposition header, plus the
+# backslash path separator that Path().name does not strip on POSIX.
+_UNSAFE_NAME_CHARS = re.compile(r'[\x00-\x1f\x7f"\\]')
+
+
+def safe_download_name(name):
+    """Make a user-supplied filename safe to embed in Content-Disposition."""
+    cleaned = _UNSAFE_NAME_CHARS.sub('', Path(name).name).strip()
+    return cleaned or 'shorts-ready.mp4'
+
 # Labels for the compatibility checks
 CHECK_LABELS = {
     'resolution': 'Resolution',
