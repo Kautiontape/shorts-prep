@@ -23,7 +23,10 @@ def _json_http_error(e):
 
 @app.errorhandler(Exception)
 def _json_error(e):
-    # Flask logs the traceback server-side; don't leak internals to the client.
+    # Registering a handler for Exception stops Flask from logging the
+    # traceback itself, so log it here -- otherwise a 500 reaches the operator
+    # with no cause. The client still gets a generic message, no internals.
+    app.logger.exception('Unhandled error: %s', e)
     return jsonify(error='Internal server error', status=500), 500
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'shorts-prep'

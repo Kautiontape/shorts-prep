@@ -391,3 +391,22 @@ def test_index_html_raises_qr_error_correction():
     import app
     assert 'CorrectLevel.M' in app.HTML
     assert 'CorrectLevel.L' not in app.HTML
+
+
+def test_internal_errors_are_logged_server_side(client, monkeypatch, caplog):
+    """Registering an errorhandler for Exception stops Flask logging the
+    traceback itself, so the handler must log it. Without this the /d/ route's
+    deliberate 'misconfiguration surfaces as a 500' behavior is invisible in
+    production -- the operator sees a generic 500 and no cause.
+    """
+    import app, r2
+    def boom(key):
+        raise RuntimeError('diagnostic-marker-xyz')
+    monkeypatch.setattr(r2, 'get_text', boom)
+
+    with caplog.at_level('ERROR'):
+        resp = client.get('/d/abcdef012345')
+
+    assert resp.status_code == 500
+    assert resp.get_json()['error'] == 'Internal server error'  # still no leak
+    assert 'diagnostic-marker-xyz' in caplog.text
