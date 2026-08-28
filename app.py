@@ -899,7 +899,7 @@ EXPIRED_HTML = '''<!doctype html>
 <body>
   <div class="box">
     <h1>This link has expired</h1>
-    <p>Processed files are kept for 24 hours. Upload your video again to get a
+    <p>Processed files are kept for about a day. Upload your video again to get a
        fresh download link.</p>
   </div>
 </body>
@@ -917,9 +917,12 @@ def download_redirect(code):
     """Short link for the QR code. Re-signs on every visit, so the QR itself
     carries no credential and never goes stale while the file exists."""
     if not JOB_ID_RE.match(code):
+        # Same page as a real expiry: never reveal whether this code was
+        # ever valid. test_download_redirect_404s_are_indistinguishable
+        # enforces that the two bodies stay byte-identical.
         return _expired_page()
     try:
-        download_name = r2.get_text(f'outputs/{code}.name')
+        download_name = safe_download_name(r2.get_text(f'outputs/{code}.name'))
     except r2.NotFound:
         return _expired_page()
     url = r2.presign_get(f'outputs/{code}.mp4', download_name, expires=300)

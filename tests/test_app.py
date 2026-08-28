@@ -231,3 +231,31 @@ def test_download_redirect_propagates_unexpected_r2_errors(client, monkeypatch):
 
     resp = client.get('/d/abcdef012345')
     assert resp.status_code == 500
+
+
+def test_download_redirect_sanitizes_the_sidecar_name(client, monkeypatch):
+    """The sidecar is data read back from R2. Even though Task 4 sanitizes on
+    write, the read side must not trust it to build a Content-Disposition."""
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: 'ev"il\r\n-shorts.mp4')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'evil-shorts.mp4'
+
+
+def test_download_redirect_falls_back_when_sidecar_is_empty(client, monkeypatch):
+    import app, r2
+    signed = {}
+    monkeypatch.setattr(r2, 'get_text', lambda key: '   ')
+    def fake_presign(key, name, expires=86400):
+        signed['name'] = name
+        return 'https://signed/x'
+    monkeypatch.setattr(r2, 'presign_get', fake_presign)
+
+    client.get('/d/abcdef012345')
+    assert signed['name'] == 'shorts-ready.mp4'
