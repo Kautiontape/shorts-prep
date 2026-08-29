@@ -5,11 +5,25 @@ fake, so it proves the two routes agree on key strings but exercises none of
 the actual boto3 code: real key handling, real presigning, and the real
 ClientError -> NotFound translation all go untested together.
 """
+import time
 from pathlib import Path
 
 import boto3
 import pytest
 from moto import mock_aws
+
+
+def _await_job(client, job, timeout=10):
+    """Poll /status the way the browser does. This test drives the real boto3
+    code, which spins up its own transfer threads, so the inline-thread stub
+    the other tests use would be substituted into s3transfer as well."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = client.get(f'/status/{job}').get_json()
+        if st['state'] != 'processing':
+            return st
+        time.sleep(0.02)
+    raise AssertionError(f'job {job} never left the processing state')
 
 
 @mock_aws
@@ -38,8 +52,10 @@ def test_process_then_download_through_real_r2(client, monkeypatch, tmp_path):
     (d / '.original_name').write_text('holiday.mp4')
 
     resp = client.post(f'/process/{job}', json={'mode': 'quick_fix'})
-    assert resp.status_code == 200, resp.get_data()
-    path = resp.get_json()['download_path']
+    assert resp.status_code == 202, resp.get_data()
+    st = _await_job(client, job)
+    assert st['state'] == 'done', st
+    path = st['result']['download_path']
     assert path == f'/d/{job}'
 
     # Real objects really landed under the deterministic keys.

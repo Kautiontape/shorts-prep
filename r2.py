@@ -53,8 +53,13 @@ def presign_put(key, expires=900):
     )
 
 
-def presign_get(key, download_name, expires=86400):
-    """Presigned GET URL (24 h) that downloads as `download_name`."""
+def presign_get(key, download_name, expires=604800):
+    """Presigned GET URL that downloads as `download_name`.
+
+    The default is the SigV4 maximum of 7 days, but /d/<code> overrides it with
+    a short window: saved links stay usable because the short link re-signs on
+    every visit, not because the signature itself is long-lived.
+    """
     return _client().generate_presigned_url(
         'get_object',
         Params={

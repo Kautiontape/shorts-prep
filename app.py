@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from fractions import Fraction
@@ -287,6 +288,102 @@ def build_ffmpeg_cmd(mode, input_path, output_path):
         ]
 
 
+def _status_path(job_dir):
+    return job_dir / 'status.json'
+
+
+def _write_status(job_dir, data):
+    """Atomically record a job's state so any gunicorn worker can report it."""
+    tmp = job_dir / 'status.json.tmp'
+    tmp.write_text(json.dumps(data))
+    tmp.replace(_status_path(job_dir))
+
+
+def _read_status(job_dir):
+    try:
+        return json.loads(_status_path(job_dir).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _prune_job_files(job_dir):
+    """Drop the large media files once a job finishes, keeping status.json so
+    /status can still report the result."""
+    for f in job_dir.iterdir():
+        if f.name == 'status.json':
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _run_job(job_id, mode):
+    """Run the ffmpeg pipeline in the background, recording progress to
+    status.json. A long re-encode can far exceed Cloudflare's ~100s proxy
+    limit, so /process can't hold the request open until it's done."""
+    job_dir = UPLOAD_DIR / job_id
+    try:
+        inputs = list(job_dir.glob('input.*'))
+        if not inputs:
+            _write_status(job_dir, {'state': 'error', 'error': 'Input file not found'})
+            return
+        input_path = inputs[0]
+
+        # Probe before
+        before_probe = probe_detailed(str(input_path))
+        before_checks = run_checks(before_probe, str(input_path))
+
+        # Use original filename with -shorts suffix
+        name_file = job_dir / '.original_name'
+        if name_file.exists():
+            orig = Path(name_file.read_text().strip()).stem
+            output_name = safe_download_name(f'{orig}-shorts.mp4')
+        else:
+            output_name = DEFAULT_DOWNLOAD_NAME
+        output_path = job_dir / output_name
+
+        cmd = build_ffmpeg_cmd(mode, input_path, output_path)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            _write_status(job_dir, {'state': 'error',
+                                    'error': f'ffmpeg failed: {result.stderr[-500:]}'})
+            return
+
+        # Probe after
+        after_probe = probe_detailed(str(output_path))
+        after_checks = run_checks(after_probe, str(output_path))
+        out_size = output_path.stat().st_size / (1024 * 1024)
+
+        # Store the result in R2 under a key derivable from job_id alone, plus a
+        # sidecar holding the display name. /d/<job_id> re-signs from those two.
+        try:
+            r2.upload_file(output_path, f'outputs/{job_id}.mp4', content_type='video/mp4')
+            r2.put_text(f'outputs/{job_id}.name', output_name)
+        except Exception as e:
+            _write_status(job_dir, {'state': 'error', 'error': f'Could not store result: {e}'})
+            return
+
+        _write_status(job_dir, {
+            'state': 'done',
+            'result': {
+                'id': job_id,
+                'output_name': output_name,
+                'mode_used': mode,
+                'before_checks': before_checks,
+                'after_checks': after_checks,
+                'file_size_mb': out_size,
+                'download_path': f'/d/{job_id}',
+            },
+        })
+    except Exception:
+        # Don't leak internals; the traceback is logged server-side.
+        app.logger.exception('job %s failed', job_id)
+        _write_status(job_dir, {'state': 'error', 'error': 'Internal server error'})
+    finally:
+        _prune_job_files(job_dir)
+
+
 def cleanup_old_jobs(max_age=7200):
     """Remove job directories older than max_age seconds."""
     now = time.time()
@@ -476,6 +573,45 @@ HTML = '''<!DOCTYPE html>
     max-width: 520px; word-break: break-all;
   }
   .error-text.visible { display: block; }
+
+  /* History */
+  .history { width: 100%; max-width: 520px; margin-top: 2rem; display: none; }
+  .history.visible { display: block; }
+  .history-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 0.5rem;
+  }
+  .history-head .section-label { margin: 0; }
+  .history-clear {
+    background: none; border: none; color: #666; font-size: 0.7rem;
+    cursor: pointer; text-decoration: underline;
+  }
+  .history-clear:hover { color: #999; }
+  .history-item {
+    display: flex; align-items: center; gap: 0.6rem;
+    background: #1a1a1a; border-radius: 8px; padding: 0.55rem 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+  .history-info { flex: 1; min-width: 0; }
+  .history-name {
+    font-size: 0.8rem; color: #ddd; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .history-meta { font-size: 0.68rem; color: #666; margin-top: 0.1rem; }
+  .history-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+  .history-btn {
+    background: #333; border: none; color: #ccc; padding: 0.3rem 0.6rem;
+    border-radius: 4px; font-size: 0.72rem; cursor: pointer;
+    white-space: nowrap; transition: background 0.2s; text-decoration: none;
+  }
+  .history-btn:hover { background: #444; }
+  .history-btn.primary { background: #ff4444; color: #fff; }
+  .history-btn.primary:hover { background: #e03030; }
+  .history-remove {
+    background: none; border: none; color: #555; font-size: 1rem;
+    cursor: pointer; line-height: 1; padding: 0 0.2rem;
+  }
+  .history-remove:hover { color: #999; }
 </style>
 </head>
 <body>
@@ -541,6 +677,15 @@ HTML = '''<!DOCTYPE html>
 
 <p class="error-text" id="errorText"></p>
 
+<!-- Past jobs (localStorage only — never leaves this browser) -->
+<div class="history" id="historySection">
+  <div class="history-head">
+    <div class="section-label">Recent jobs</div>
+    <button class="history-clear" id="historyClear">Clear all</button>
+  </div>
+  <div id="historyList"></div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script>
 // Elements
@@ -570,6 +715,9 @@ const qrCode = document.getElementById('qrCode');
 const downloadBtn = document.getElementById('downloadBtn');
 const resetBtn = document.getElementById('resetBtn');
 const errorText = document.getElementById('errorText');
+const historySection = document.getElementById('historySection');
+const historyList = document.getElementById('historyList');
+const historyClear = document.getElementById('historyClear');
 
 const CHECK_LABELS = {
   resolution: 'Resolution', pix_fmt: 'Pixel format', video_codec: 'Video codec',
@@ -585,6 +733,8 @@ const CHECK_ORDER = ['resolution', 'pix_fmt', 'video_codec', 'audio_codec',
 
 let currentJobId = null;
 let selectedMode = null;
+let currentFilename = null;
+let currentFileSizeMb = null;
 
 // Drop zone events
 dropZone.addEventListener('click', () => fileInput.click());
@@ -609,28 +759,62 @@ copyBtn.addEventListener('click', () => {
 cancelBtn.addEventListener('click', resetAll);
 resetBtn.addEventListener('click', resetAll);
 
+historyClear.addEventListener('click', () => {
+  saveHistory([]);
+  renderHistory(true);
+});
+
 processBtn.addEventListener('click', async () => {
   if (!currentJobId || !selectedMode) return;
   showPanel('processPanel');
   procFileName.textContent = diagFileName.textContent;
   procStatus.textContent = selectedMode === 're_encode' ? 'Re-encoding (this may take a few minutes)...' : 'Processing...';
   try {
+    // Kick off processing. It runs in the background on the server so the
+    // request returns immediately (a long re-encode would otherwise blow past
+    // Cloudflare's ~100s proxy timeout and 524).
     const resp = await fetch('/process/' + currentJobId, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({mode: selectedMode}),
     });
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.error || 'Processing failed');
-    }
-    const result = await resp.json();
+    const start = await readJson(resp);
+    if (!resp.ok) throw new Error(start.error || ('HTTP ' + resp.status));
+
+    // Poll until the job finishes. Each poll is a quick request, so no 524.
+    const result = await pollStatus(currentJobId);
     showResults(result);
   } catch (err) {
     showError(err.message);
     showPanel(null);
   }
 });
+
+// Poll /status until the job is done or errors. Returns the result object.
+function pollStatus(jobId) {
+  const POLL_MS = 3000;
+  const MAX_MS = 30 * 60 * 1000;  // give a long re-encode up to 30 minutes
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      if (Date.now() - start > MAX_MS) {
+        reject(new Error('Processing timed out. Please try again.'));
+        return;
+      }
+      try {
+        const resp = await fetch('/status/' + jobId);
+        const data = await readJson(resp);
+        if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.state === 'done') { resolve(data.result); return; }
+        if (data.state === 'error') { reject(new Error(data.error || 'Processing failed')); return; }
+        setTimeout(tick, POLL_MS);  // still processing
+      } catch (err) {
+        reject(err);
+      }
+    };
+    tick();
+  });
+}
 
 function resetAll() {
   showPanel(null);
@@ -645,6 +829,8 @@ function resetAll() {
   errorText.classList.remove('visible');
   currentJobId = null;
   selectedMode = null;
+  currentFilename = null;
+  currentFileSizeMb = null;
 }
 
 function showPanel(id) {
@@ -652,6 +838,94 @@ function showPanel(id) {
     document.getElementById(p).classList.toggle('visible', p === id);
   });
   dropZone.classList.toggle('processing', id !== null);
+  // History only shows in the idle state (drop zone visible, no active step).
+  renderHistory(id === null);
+}
+
+// ── Job history (localStorage only — nothing is sent to the server) ──
+// Each entry: { jobId, filename, fileSizeMb, mode, outputName, downloadPath, ts }
+const HISTORY_KEY = 'shortsPrepJobs';
+const HISTORY_MAX = 25;
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
+  } catch (e) { /* storage full or disabled — history is best-effort */ }
+}
+
+// Record (or refresh) a finished job at the top of the list.
+function recordJob(entry) {
+  const list = loadHistory().filter(j => j.jobId !== entry.jobId);
+  list.unshift(entry);
+  saveHistory(list);
+}
+
+function removeJob(jobId) {
+  saveHistory(loadHistory().filter(j => j.jobId !== jobId));
+  renderHistory(true);
+}
+
+function renderHistory(idle) {
+  const list = loadHistory();
+  historySection.classList.toggle('visible', !!idle && list.length > 0);
+  if (!idle || !list.length) return;
+  historyList.innerHTML = '';
+  list.forEach(entry => {
+    const when = new Date(entry.ts).toLocaleString();
+    const size = entry.fileSizeMb != null ? entry.fileSizeMb.toFixed(1) + ' MB · ' : '';
+    const item = document.createElement('div');
+    item.className = 'history-item';
+
+    const info = document.createElement('div');
+    info.className = 'history-info';
+    info.innerHTML =
+      '<div class="history-name">' + escapeHtml(entry.filename) + '</div>' +
+      '<div class="history-meta">' + size + escapeHtml(entry.mode || '') + ' · ' + escapeHtml(when) + '</div>';
+
+    const actions = document.createElement('div');
+    actions.className = 'history-actions';
+
+    const dl = document.createElement('a');
+    dl.className = 'history-btn';
+    dl.textContent = 'Download';
+    // Entries saved before short links held a presigned URL that has long
+    // since expired; /d/<jobId> shows the expired page, which is honest.
+    dl.href = entry.downloadPath || ('/d/' + entry.jobId);
+    if (entry.outputName) dl.download = entry.outputName;
+
+    const redo = document.createElement('button');
+    redo.className = 'history-btn primary';
+    redo.textContent = 'Re-process';
+    redo.addEventListener('click', () => reprocessJob(entry));
+
+    const del = document.createElement('button');
+    del.className = 'history-remove';
+    del.innerHTML = '&times;';
+    del.title = 'Remove from history';
+    del.addEventListener('click', () => removeJob(entry.jobId));
+
+    actions.appendChild(dl);
+    actions.appendChild(redo);
+    item.appendChild(info);
+    item.appendChild(actions);
+    item.appendChild(del);
+    historyList.appendChild(item);
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 }
 
 async function analyzeFile(file) {
@@ -679,17 +953,39 @@ async function analyzeFile(file) {
     // 3. Analyze the uploaded object
     statusText.textContent = 'Analyzing...';
     progressFill.classList.add('indeterminate');
-    const anResp = await fetch('/analyze', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({job_id: cu.job_id, filename: file.name}),
-    });
-    const data = await readJson(anResp);
-    if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
-    currentJobId = data.id;
-    showDiagnostics(data);
+    await runAnalyze(cu.job_id, file.name);
   } catch (err) {
     showError(err.message);
+    showPanel(null);
+  }
+}
+
+// Analyze an object already in R2 (used by a fresh upload and by re-processing a
+// past job from history, which skips the upload entirely).
+async function runAnalyze(jobId, filename) {
+  const anResp = await fetch('/analyze', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({job_id: jobId, filename: filename}),
+  });
+  const data = await readJson(anResp);
+  if (!anResp.ok) throw new Error(data.error || ('HTTP ' + anResp.status));
+  currentJobId = data.id;
+  showDiagnostics(data);
+}
+
+// Re-run a past job: re-analyze its retained R2 source (no re-upload) and drop
+// the user back on the diagnostics panel to pick a mode.
+async function reprocessJob(entry) {
+  errorText.classList.remove('visible');
+  showPanel('uploadPanel');
+  fileName.textContent = entry.filename;
+  progressFill.classList.add('indeterminate');
+  statusText.textContent = 'Loading previous upload...';
+  try {
+    await runAnalyze(entry.jobId, entry.filename);
+  } catch (err) {
+    showError(err.message + ' (the source may have expired — re-upload to process again)');
     showPanel(null);
   }
 }
@@ -742,6 +1038,8 @@ function putToR2(url, file) {
 }
 
 function showDiagnostics(data) {
+  currentFilename = data.filename;
+  currentFileSizeMb = data.file_size_mb;
   diagFileName.textContent = data.filename + '  (' + data.file_size_mb.toFixed(1) + ' MB)';
   const checks = data.checks;
   const rec = data.recommended_mode;
@@ -866,6 +1164,18 @@ function showResults(result) {
   new QRCode(qrCode, { text: fullUrl, width: 160, height: 160,
     colorDark: '#ffffff', colorLight: '#1a1a1a', correctLevel: QRCode.CorrectLevel.M });
 
+  // Remember this job so it can be re-downloaded or re-processed without a
+  // re-upload. localStorage only — nothing is sent to the server.
+  recordJob({
+    jobId: result.id,
+    filename: currentFilename || result.output_name,
+    fileSizeMb: currentFileSizeMb,
+    mode: result.mode_used,
+    outputName: result.output_name,
+    downloadPath: result.download_path,
+    ts: Date.now(),
+  });
+
   showPanel('resultPanel');
 }
 
@@ -873,6 +1183,9 @@ function showError(msg) {
   errorText.textContent = msg;
   errorText.classList.add('visible');
 }
+
+// Show any saved jobs on load (idle state).
+renderHistory(true);
 </script>
 </body>
 </html>'''
@@ -905,8 +1218,8 @@ EXPIRED_HTML = '''<!doctype html>
 <body>
   <div class="box">
     <h1>This link has expired</h1>
-    <p>Processed files are kept for about a day. Upload your video again to get a
-       fresh download link.</p>
+    <p>Processed files are kept for about a month. Upload your video again to get
+       a fresh download link.</p>
   </div>
 </body>
 </html>'''
@@ -984,11 +1297,9 @@ def analyze():
     rec = recommend_mode(checks)
     file_size = input_path.stat().st_size / (1024 * 1024)
 
-    # The local copy is the working copy now; drop the R2 input.
-    try:
-        r2.delete(key)
-    except Exception:
-        pass
+    # Keep the R2 input around (the lifecycle rule expires it later). This lets
+    # the browser re-analyze and re-process a past job from its history without
+    # re-uploading the source.
 
     return jsonify(
         id=job_id,
@@ -1011,7 +1322,6 @@ def process(job_id):
     inputs = list(job_dir.glob('input.*'))
     if not inputs:
         return jsonify(error='Input file not found'), 404
-    input_path = inputs[0]
 
     data = request.get_json(silent=True) or {}
     mode = data.get('mode', 'quick_fix')
@@ -1020,50 +1330,22 @@ def process(job_id):
     if mode == 'metadata_fix' and not BSF_AVAILABLE:
         return jsonify(error='Metadata fix not available in this ffmpeg build'), 400
 
-    # Probe before
-    before_probe = probe_detailed(str(input_path))
-    before_checks = run_checks(before_probe, str(input_path))
+    # A full re-encode can run for minutes — far past Cloudflare's ~100s proxy
+    # timeout (524). Do the work in a background thread and let the browser poll
+    # /status, so every HTTP request returns immediately.
+    _write_status(job_dir, {'state': 'processing', 'mode': mode})
+    threading.Thread(target=_run_job, args=(job_id, mode), daemon=True).start()
+    return jsonify(id=job_id, state='processing'), 202
 
-    # Use original filename with -shorts suffix
-    name_file = job_dir / '.original_name'
-    if name_file.exists():
-        orig = Path(name_file.read_text().strip()).stem
-        output_name = safe_download_name(f'{orig}-shorts.mp4')
-    else:
-        output_name = DEFAULT_DOWNLOAD_NAME
 
-    output_path = job_dir / output_name
-
-    cmd = build_ffmpeg_cmd(mode, input_path, output_path)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return jsonify(error=f'ffmpeg failed: {result.stderr[-500:]}'), 500
-
-    # Probe after
-    after_probe = probe_detailed(str(output_path))
-    after_checks = run_checks(after_probe, str(output_path))
-    out_size = output_path.stat().st_size / (1024 * 1024)
-
-    # Store the result in R2 under a key derivable from job_id alone, plus a
-    # sidecar holding the display name. /d/<job_id> re-signs from those two.
-    try:
-        r2.upload_file(output_path, f'outputs/{job_id}.mp4', content_type='video/mp4')
-        r2.put_text(f'outputs/{job_id}.name', output_name)
-    except Exception as e:
-        return jsonify(error=f'Could not store result: {e}'), 502
-
-    # Clean up local working files.
-    shutil.rmtree(job_dir, ignore_errors=True)
-
-    return jsonify(
-        id=job_id,
-        output_name=output_name,
-        mode_used=mode,
-        before_checks=before_checks,
-        after_checks=after_checks,
-        file_size_mb=out_size,
-        download_path=f'/d/{job_id}',
-    )
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id):
+    if not JOB_ID_RE.match(job_id):
+        return jsonify(error='Invalid job id'), 400
+    st = _read_status(UPLOAD_DIR / job_id)
+    if st is None:
+        return jsonify(error='Job not found'), 404
+    return jsonify(st)
 
 
 if __name__ == '__main__':

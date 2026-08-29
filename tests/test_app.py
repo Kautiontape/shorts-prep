@@ -27,7 +27,7 @@ def test_unknown_route_returns_json_not_html(client):
     assert 'error' in resp.get_json()
 
 
-def test_analyze_downloads_probes_and_deletes_input(client, monkeypatch):
+def test_analyze_downloads_probes_and_keeps_input(client, monkeypatch):
     import app, r2
     written = {}
     def fake_download(key, path):
@@ -47,7 +47,8 @@ def test_analyze_downloads_probes_and_deletes_input(client, monkeypatch):
     assert body['id'] == 'abcdef012345'
     assert body['recommended_mode'] == 'quick_fix'
     assert written['key'] == 'inputs/abcdef012345.mp4'
-    assert deleted['key'] == 'inputs/abcdef012345.mp4'
+    # The R2 input is retained so the job can be re-processed from history.
+    assert deleted == {}
 
 
 def test_analyze_rejects_bad_job_id(client):
@@ -72,9 +73,22 @@ def _seed_job(app, job_id='abcdef012345', orig='clip.mp4'):
     return job_dir
 
 
-def test_process_uploads_result_and_returns_short_path(client, monkeypatch):
+class _InlineThread:
+    """Stand-in for threading.Thread that runs the target synchronously on
+    start(), so the async /process flow is deterministic under test."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+
+def test_process_uploads_result_and_status_returns_short_path(client, monkeypatch):
     import app, r2
     job_dir = _seed_job(app)
+    monkeypatch.setattr(app.threading, 'Thread', _InlineThread)
 
     def fake_run(cmd, capture_output=True, text=True):
         Path(cmd[-1]).write_bytes(b'\x00' * 20)  # cmd[-1] is the output path
@@ -91,20 +105,58 @@ def test_process_uploads_result_and_returns_short_path(client, monkeypatch):
                         lambda path, key, content_type='application/octet-stream': uploaded.update(key=key))
     monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
 
+    # /process returns immediately with 202; the job runs inline via _InlineThread.
     resp = client.post('/process/abcdef012345', json={'mode': 'quick_fix'})
-    assert resp.status_code == 200
-    body = resp.get_json()
-    assert body['output_name'] == 'clip-shorts.mp4'
+    assert resp.status_code == 202
+    assert resp.get_json()['state'] == 'processing'
+
+    # /status now reports the finished result.
+    sresp = client.get('/status/abcdef012345')
+    assert sresp.status_code == 200
+    body = sresp.get_json()
+    assert body['state'] == 'done'
+    result = body['result']
+    assert result['output_name'] == 'clip-shorts.mp4'
     assert uploaded['key'] == 'outputs/abcdef012345.mp4'
     assert texts == {'outputs/abcdef012345.name': 'clip-shorts.mp4'}
-    assert body['download_path'] == '/d/abcdef012345'
-    assert 'download_url' not in body
-    assert not job_dir.exists()  # local temp cleaned up
+    assert result['download_path'] == '/d/abcdef012345'
+    assert 'download_url' not in result
+    # Large media pruned, but status.json is kept so the poll can read it.
+    assert (job_dir / 'status.json').exists()
+    assert not list(job_dir.glob('input.*'))
+
+
+def test_process_returns_202_before_job_finishes(client, monkeypatch):
+    import app
+    _seed_job(app, job_id='abcdef555555')
+
+    # Default real threading.Thread, but make the work block so the job is still
+    # 'processing' when /process returns — proving we don't hold the request.
+    gate = {'released': False}
+
+    def slow_run(cmd, capture_output=True, text=True):
+        while not gate['released']:
+            pass
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(app.subprocess, 'run', slow_run)
+    monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
+    monkeypatch.setattr(app, 'run_checks', lambda probe, p: {})
+
+    resp = client.post('/process/abcdef555555', json={'mode': 're_encode'})
+    assert resp.status_code == 202
+
+    sresp = client.get('/status/abcdef555555')
+    assert sresp.get_json()['state'] == 'processing'
+    gate['released'] = True  # let the background thread finish and exit cleanly
 
 
 def test_process_sanitizes_the_stored_download_name(client, monkeypatch):
     import app, r2
     _seed_job(app, job_id='abcdef012399', orig='my "weird" clip.mp4')
+    monkeypatch.setattr(app.threading, 'Thread', _InlineThread)
 
     def fake_run(cmd, capture_output=True, text=True):
         Path(cmd[-1]).write_bytes(b'\x00' * 20)
@@ -122,13 +174,16 @@ def test_process_sanitizes_the_stored_download_name(client, monkeypatch):
     monkeypatch.setattr(r2, 'put_text', lambda key, text: texts.update({key: text}))
 
     resp = client.post('/process/abcdef012399', json={'mode': 'quick_fix'})
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert texts == {'outputs/abcdef012399.name': 'my weird clip-shorts.mp4'}
 
 
-def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
+def test_process_records_an_error_when_the_sidecar_write_fails(client, monkeypatch):
+    """The upload half can succeed while the name sidecar fails, leaving an
+    output /d/<code> could never resolve. The job must report that, not 'done'."""
     import app, r2
     _seed_job(app, job_id='abcdef0123aa')
+    monkeypatch.setattr(app.threading, 'Thread', _InlineThread)
 
     def fake_run(cmd, capture_output=True, text=True):
         Path(cmd[-1]).write_bytes(b'\x00' * 20)
@@ -147,7 +202,11 @@ def test_process_returns_502_when_sidecar_write_fails(client, monkeypatch):
     monkeypatch.setattr(r2, 'put_text', boom)
 
     resp = client.post('/process/abcdef0123aa', json={'mode': 'quick_fix'})
-    assert resp.status_code == 502
+    assert resp.status_code == 202
+
+    body = client.get('/status/abcdef0123aa').get_json()
+    assert body['state'] == 'error'
+    assert 'Could not store result' in body['error']
 
 
 def test_process_then_download_redirect_round_trip(client, monkeypatch):
@@ -191,9 +250,10 @@ def test_process_then_download_redirect_round_trip(client, monkeypatch):
     monkeypatch.setattr(app, 'run_checks', lambda probe, p: fake_checks)
 
     _seed_job(app, job_id='abcdef0123ee', orig='holiday.mp4')
+    monkeypatch.setattr(app.threading, 'Thread', _InlineThread)
     resp = client.post('/process/abcdef0123ee', json={'mode': 'quick_fix'})
-    assert resp.status_code == 200
-    download_path = resp.get_json()['download_path']
+    assert resp.status_code == 202
+    download_path = client.get('/status/abcdef0123ee').get_json()['result']['download_path']
 
     # Follow the very path the client will put in the QR code.
     follow = client.get(download_path)
@@ -222,9 +282,15 @@ def test_process_invalid_mode_returns_400(client):
     assert resp.status_code == 400
 
 
-def test_process_ffmpeg_failure_returns_500(client, monkeypatch):
+def test_process_missing_job_returns_404(client):
+    resp = client.post('/process/abcdef111111', json={'mode': 'quick_fix'})
+    assert resp.status_code == 404
+
+
+def test_process_ffmpeg_failure_sets_error_status(client, monkeypatch):
     import app
     _seed_job(app, job_id='abcdef000bad')
+    monkeypatch.setattr(app.threading, 'Thread', _InlineThread)
     monkeypatch.setattr(app, 'probe_detailed', lambda p: {'streams': [], 'format': {}})
     monkeypatch.setattr(app, 'run_checks', lambda probe, p: {})
     def fail_run(cmd, capture_output=True, text=True):
@@ -233,8 +299,24 @@ def test_process_ffmpeg_failure_returns_500(client, monkeypatch):
             stderr = 'boom'
         return R()
     monkeypatch.setattr(app.subprocess, 'run', fail_run)
+
     resp = client.post('/process/abcdef000bad', json={'mode': 'quick_fix'})
-    assert resp.status_code == 500
+    assert resp.status_code == 202
+
+    body = client.get('/status/abcdef000bad').get_json()
+    assert body['state'] == 'error'
+    assert 'ffmpeg failed' in body['error']
+
+
+def test_status_unknown_job_returns_404(client):
+    resp = client.get('/status/abcdef222222')
+    assert resp.status_code == 404
+    assert resp.get_json() is not None
+
+
+def test_status_rejects_bad_job_id(client):
+    resp = client.get('/status/BAD')
+    assert resp.status_code == 400
 
 
 def test_download_route_removed(client):
