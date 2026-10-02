@@ -1,0 +1,15 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: Kautiontape/ci/.github/workflows/python.yml@main
+    with:
+      python-version: "3.14"
+      run: "pytest -q"
